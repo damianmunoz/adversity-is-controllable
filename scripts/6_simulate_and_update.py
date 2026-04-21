@@ -24,7 +24,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from src.execution.updater import ExecutionConfig, run
-from src.policy.hedge import HedgePolicy, PolicyConfig
+from src.policy.actions import Action
+from src.policy.hedge import PolicyConfig, make_policy
 from src.state.kalman_filter import KalmanConfig, KalmanFilter
 from src.utils.config import load_config
 from src.utils.io import iter_parquet_dir
@@ -41,14 +42,18 @@ def main() -> None:
     execution_cfg = load_config("configs/execution.yaml", ExecutionConfig)
 
     kalman = KalmanFilter(kalman_cfg)
-    policy = HedgePolicy(policy_cfg, seed=None)
+    policy = make_policy(policy_cfg, seed=None)
 
     log.info(
-        "Starting run — λ=%.2f η=%.3f features_dir=%s",
+        "Starting run — mode=%s λ=%.2f η=%.3f features_dir=%s",
+        policy_cfg.mode,
         execution_cfg.lambda_,
         policy_cfg.learning_rate,
         FEATURES_DIR,
     )
+    if policy_cfg.mode == "bucketed":
+        log.info("Pressure edges: %s  (%d buckets)",
+                 policy_cfg.pressure_edges, len(policy_cfg.pressure_edges) + 1)
 
     feature_rows = iter_parquet_dir(FEATURES_DIR)
     total = run(
@@ -59,17 +64,27 @@ def main() -> None:
         obs_features=kalman_cfg.obs_features,
     )
 
-    final_weights = policy.weights()
     log.info("Run complete — %d ticks processed.", total)
+    final_weights = policy.weights()
     log.info(
-        "Final weights — WAIT: %.4f  PASSIVE: %.4f  AGGRESSIVE: %.4f",
+        "Final weights (last-bucket view) — WAIT: %.4f  PASSIVE: %.4f  AGGRESSIVE: %.4f",
         final_weights[Action.WAIT],
         final_weights[Action.PASSIVE],
         final_weights[Action.AGGRESSIVE],
     )
+
+    if hasattr(policy, "bucket_summary"):
+        log.info("Per-bucket final weights:")
+        log.info("  %-6s %-22s %-8s %-10s %-10s %-10s",
+                 "bucket", "pressure range", "visits", "WAIT", "PASSIVE", "AGGR")
+        for b in policy.bucket_summary():
+            w = b["weights"]
+            log.info("  %-6d %-22s %-8d %-10.4f %-10.4f %-10.4f",
+                     b["bucket"], b["range"], b["visits"],
+                     w[Action.WAIT], w[Action.PASSIVE], w[Action.AGGRESSIVE])
+
     log.info("Execution log → %s", execution_cfg.output_dir)
 
 
 if __name__ == "__main__":
-    from src.policy.actions import Action
     main()

@@ -33,8 +33,9 @@ realized losses what those states imply for execution cost — no handcrafted ru
 
 from __future__ import annotations
 
+import bisect
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -51,9 +52,18 @@ log = get_logger(__name__)
 
 @dataclass
 class PolicyConfig:
-    """Mirrors configs/policy.yaml."""
-    learning_rate: float        # η — step size for the multiplicative update
-    initial_weight: float = 1.0 # all actions start with equal weight
+    """Mirrors configs/policy.yaml.
+
+    `mode` selects the policy variant:
+      "marginal" — classical Hedge with a single weight vector (default).
+      "bucketed" — BucketedHedgePolicy: one Hedge per market_pressure bucket,
+                   so learned weights differ across regimes. Requires
+                   `pressure_edges` (N-1 cutpoints → N buckets).
+    """
+    learning_rate:  float        # η — step size for the multiplicative update
+    initial_weight: float        = 1.0
+    mode:           str          = "marginal"
+    pressure_edges: List[float]  = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -208,3 +218,159 @@ class HedgePolicy:
     def weights(self) -> Dict[Action, float]:
         """Return a copy of the current weight distribution."""
         return dict(self._weights)
+
+
+# ---------------------------------------------------------------------------
+# Bucketed (state-conditioned) Hedge
+# ---------------------------------------------------------------------------
+
+class BucketedHedgePolicy:
+    """State-conditioned Hedge: one Hedge weight vector per market_pressure bucket.
+
+    Rationale:
+      Classical Hedge (above) learns a single marginal distribution over
+      actions. It never looks at market_pressure or regime when selecting.
+      The Kalman filter's output is therefore decorative in the baseline.
+
+      BucketedHedgePolicy discretizes market_pressure into N buckets using
+      config.pressure_edges (N-1 cutpoints) and maintains one Hedge weight
+      vector per bucket. At selection time the current bucket is looked up
+      from ctx.market_pressure; action is sampled from THAT bucket's weights.
+      On update, only that bucket's weights change. Each bucket therefore
+      runs its own regret-minimization and the classical Hedge guarantees
+      hold WITHIN each bucket.
+
+      Trade-off: data per bucket = total_ticks / N. With 38k ticks and 5
+      buckets that's ~7.6k ticks each — still enough for a few hundred
+      exponential updates to converge.
+
+    Interface is identical to HedgePolicy: select(ctx) / update(action, loss) /
+    weights(). The `weights()` method returns the MOST RECENTLY USED bucket's
+    weights so the outer loop's "final weights" log line is well-defined;
+    call `bucket_summary()` for the full picture across buckets.
+    """
+
+    def __init__(self, config: PolicyConfig, seed: Optional[int] = None) -> None:
+        if config.mode != "bucketed":
+            raise ValueError(
+                f"BucketedHedgePolicy requires mode='bucketed', got '{config.mode}'"
+            )
+        if not config.pressure_edges:
+            raise ValueError(
+                "BucketedHedgePolicy requires non-empty pressure_edges "
+                "(N-1 cutpoints → N buckets)"
+            )
+        # Edges must be strictly ascending so bisect returns a meaningful index
+        if list(config.pressure_edges) != sorted(config.pressure_edges):
+            raise ValueError("pressure_edges must be in ascending order")
+
+        self.config = config
+        self._rng   = np.random.default_rng(seed)
+        self._edges = list(config.pressure_edges)
+        n_buckets   = len(self._edges) + 1
+
+        w_init = config.initial_weight
+        uniform_total = w_init * len(_ACTIONS)
+        self._buckets: List[Dict[Action, float]] = [
+            {a: w_init / uniform_total for a in _ACTIONS}
+            for _ in range(n_buckets)
+        ]
+        self._visits: List[int] = [0] * n_buckets
+        self._last_bucket: int  = 0  # valid after the first select()
+
+    # ------------------------------------------------------------------
+    # Bucket lookup
+    # ------------------------------------------------------------------
+
+    def _which_bucket(self, market_pressure: float) -> int:
+        """Return bucket index for a given pressure value.
+
+        bisect_right gives N possible return values for N-1 edges:
+          pressure <= edges[0]                        → 0
+          edges[i-1] < pressure <= edges[i]           → i
+          pressure >  edges[-1]                       → len(edges)
+        """
+        return bisect.bisect_right(self._edges, market_pressure)
+
+    # ------------------------------------------------------------------
+    # Selection
+    # ------------------------------------------------------------------
+
+    def select(self, ctx: PolicyContext) -> PolicyDecision:
+        bucket = self._which_bucket(ctx.market_pressure)
+        self._last_bucket = bucket
+        self._visits[bucket] += 1
+
+        w = self._buckets[bucket]
+        probs = [w[a] for a in _ACTIONS]
+        idx = int(self._rng.choice(len(_ACTIONS), p=probs))
+        chosen = _ACTIONS[idx]
+
+        log.debug(
+            "ts=%d bucket=%d pressure=%.3f select=%s probs=[%.3f,%.3f,%.3f]",
+            ctx.ts_ms, bucket, ctx.market_pressure, chosen.value,
+            probs[0], probs[1], probs[2],
+        )
+
+        return PolicyDecision(
+            ts_ms=ctx.ts_ms,
+            action=chosen.value,
+            prob_wait=probs[0],
+            prob_passive=probs[1],
+            prob_aggressive=probs[2],
+            weight_wait=probs[0],
+            weight_passive=probs[1],
+            weight_aggressive=probs[2],
+        )
+
+    # ------------------------------------------------------------------
+    # Weight update (only the bucket used for selection updates)
+    # ------------------------------------------------------------------
+
+    def update(self, action: Action, loss: float) -> None:
+        w = self._buckets[self._last_bucket]
+        w[action] *= math.exp(-self.config.learning_rate * loss)
+        total = sum(w.values())
+        for a in w:
+            w[a] /= total
+
+    # ------------------------------------------------------------------
+    # Inspection
+    # ------------------------------------------------------------------
+
+    def weights(self) -> Dict[Action, float]:
+        """Weights of the most recently selected bucket (for parity with HedgePolicy)."""
+        return dict(self._buckets[self._last_bucket])
+
+    def bucket_summary(self) -> List[Dict]:
+        """Per-bucket visit count and final weights. Use this for post-run analysis."""
+        summaries: List[Dict] = []
+        for i, (w, visits) in enumerate(zip(self._buckets, self._visits)):
+            # Describe the pressure range covered by this bucket
+            lo = "-inf"         if i == 0                 else f"{self._edges[i-1]:+.3f}"
+            hi = "+inf"         if i == len(self._edges)  else f"{self._edges[i]:+.3f}"
+            summaries.append({
+                "bucket":  i,
+                "range":   f"({lo}, {hi}]",
+                "visits":  visits,
+                "weights": dict(w),
+            })
+        return summaries
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
+def make_policy(config: PolicyConfig, seed: Optional[int] = None):
+    """Instantiate the policy variant selected by config.mode.
+
+    Returns an object with select()/update()/weights() compatible with both
+    variants. BucketedHedgePolicy additionally exposes bucket_summary().
+    """
+    mode = (config.mode or "marginal").lower()
+    if mode == "marginal":
+        return HedgePolicy(config, seed=seed)
+    if mode == "bucketed":
+        return BucketedHedgePolicy(config, seed=seed)
+    raise ValueError(f"Unknown policy mode '{config.mode}'. Expected 'marginal' or 'bucketed'.")
