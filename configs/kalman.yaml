@@ -1,0 +1,67 @@
+# configs/kalman.yaml
+
+# Hidden state dimension
+# x = [market_pressure, regime]
+state_dim: 2
+
+# Observation vector
+# Order matters — defines the rows of H
+# These are column names from FeatureVector
+obs_features:
+  - depth_imbalance
+  - ofi_l1
+  - vol_5s
+
+obs_dim: 3
+
+# State transition matrix F (2x2)
+# x_k = F * x_{k-1}
+# Diagonal decay: pressure fades faster than regime
+F:
+  - [0.9,  0.0]
+  - [0.0,  0.95]
+
+# Observation matrix H (obs_dim x state_dim) = (3x2)
+# z = H * x
+# depth_imbalance and ofi_l1 observe market_pressure
+# vol_5s observes regime
+H:
+  - [1.0,  0.0]
+  - [1.0,  0.0]
+  - [0.0,  1.0]
+
+# Process noise covariance Q (2x2)
+# How much the hidden state can randomly jump between ticks
+# Regime is stickier than pressure so its variance is smaller
+Q:
+  - [0.01,  0.0]
+  - [0.0,   0.005]
+
+# Observation noise covariance R (3x3)
+# Recalibrated 2026-04-21 from the first post-recovery clean window
+# (38,973 rows, 10.85h of uninterrupted BTCUSDT, sequence_gap=0).
+# Prior values came from corrupted data (the 98%-mid>ask bug) and were biased
+# downward because the stuck book produced artificially low feature variance.
+# Clean empirical variances:
+#   depth_imbalance var = 4.486e-1   (was 0.0965 — ~4.6x higher)
+#   ofi_l1          var = 2.288      (was 0.3268 — ~7x higher)
+#   vol_5s          var = 1.249e-9   (was 1e-6   — ~800x lower)
+# The large R[2,2] drop should finally give the regime dimension live signal.
+# vol_5s is still sparse (nonzero in 45.85% of ticks) but with true Gaussianized R
+# the filter can react to real volatility events instead of being frozen.
+R:
+  - [0.4486,  0.0,     0.0   ]
+  - [0.0,     2.2878,  0.0   ]
+  - [0.0,     0.0,     1.249e-9]
+
+# Initial state estimate x0 (length = state_dim)
+# Start at zero — no directional bias assumed
+x0:
+  - 0.0
+  - 0.0
+
+# Initial state covariance P0 (2x2)
+# Wide uncertainty — let the filter learn fast from first observations
+P0:
+  - [1.0,  0.0]
+  - [0.0,  1.0]

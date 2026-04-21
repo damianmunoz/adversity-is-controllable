@@ -1,0 +1,146 @@
+Full Project Structure                                                                                 
+                                                                                                         
+  adversity-is-controllable/                                                                             
+  ├── configs/                                                                                           
+  │   ├── binance_btcusdt.yaml    # existing — exchange/stream settings
+  │   ├── book.yaml               # NEW — depth limit, buffer sizes                                      
+  │   ├── features.yaml           # NEW — window sizes (ms), OFI levels                                  
+  │   ├── kalman.yaml             # NEW — process/observation noise matrices                             
+  │   └── policy.yaml             # NEW — eta, learning rate, action set                                 
+  │                                                                                                      
+  ├── src/                                                                                               
+  │   ├── ingest/                 # STEP 1 — DONE ✓                                                      
+  │   │   ├── ws_ingest.py                                                                               
+  │   │   └── rest_snapshot.py
+  │   │                                                                                                  
+  │   ├── book/                   # STEP 2 - Denzel Washington ✓                                                               
+  │   │   ├── order_book.py       # LOB data structure (SortedDict, best bid/ask)
+  │   │   └── book_builder.py     # replay: snapshot + depth updates → BookSnapshot                      
+  │   │                                                                                                  
+  │   ├── features/               # STEP 3 - im too fkin clean ✓                                                                 
+  │   │   ├── ofi.py              # Order Flow Imbalance per level                                       
+  │   │   ├── spread.py           # bid-ask spread, mid-price, microprice                                
+  │   │   ├── imbalance.py        # depth-weighted imbalance (-1 to +1)                                  
+  │   │   ├── volatility.py       # rolling realized vol (1s, 5s, 30s windows)                           
+  │   │   └── feature_pipeline.py # orchestrates → FeatureVector                                         
+  │   │                                                                                                  
+  │   ├── state/                  # STEP 4 — NEW module  in prog but come on ✓                                                 
+  │   │   └── kalman_filter.py    # hidden state: [market_pressure, regime]                              
+  │   │                                                                                                  
+  │   ├── policy/                 # STEP 5 — NEW module
+  │   │   ├── actions.py          # Action enum: WAIT / PASSIVE / AGGRESSIVE                             
+  │   │   └── hedge.py            # Hedge algorithm, weight update, action select                        
+  │   │                                                                                                  
+  │   ├── execution/              # STEPS 6+7 — NEW module                                               
+  │   │   ├── simulator.py        # simulate fill against LOB + trade stream                             
+  │   │   ├── loss.py             # slippage + λ * adverse_move                                          
+  │   │   └── updater.py          # outer loop: kalman → policy → sim → loss → update                    
+  │   │                                                                                                  
+  │   └── utils/  
+  │       ├── config.py           # YAML → typed dataclasses loader                                      
+  │       ├── io.py               # JSONL reader (lazy), Parquet writer
+  │       ├── time_utils.py       # consolidates utc_now_ms, hour_partition                              
+  │       └── logging.py          # structured logger wrapper                                            
+  │                                                                                                      
+  ├── scripts/                                                                                           
+  │   ├── 1_ingest_ws.py          # DONE ✓
+  │   ├── 2_build_book.py         # → book_builder.py                                                    
+  │   ├── 3_featuregen.py         # → feature_pipeline.py                                                
+  │   ├── 4_run_kalman.py         # → kalman_filter.py (batch/debug mode)                                
+  │   ├── 5_run_policy.py         # → hedge.py (inspect weights, test actions)                           
+  │   └── 6_simulate_and_update.py # full episode loop (steps 4–7 together)                              
+  │                                                                                                      
+  └── data/                                                                                              
+      ├── raw/                    # POPULATED ✓ (trades + depth_updates)                                 
+      └── derived/                                                                                       
+          ├── book_state/         # BookSnapshot Parquet (output of step 2)                              
+          ├── features/           # FeatureVector Parquet (output of step 3)                             
+          └── execution_log/      # per-step action/loss records (output of step 6)                      
+                                                                                                         
+  ---                                                                                                    
+  Data Flow Between Steps                                                                                
+                  
+  Step 1  →  data/raw/**/*.jsonl
+             (trades: price, qty, is_buyer_maker, trade_time_ms)                                         
+             (depth_updates: first_update_id, final_update_id, bids, asks)                               
+                                                                                                         
+  Step 2  →  BookSnapshot (in-memory + Parquet)                                                          
+             (ts_ms, last_update_id, top-20 bids/asks)                                                   
+                                                                                                         
+  Step 3  →  FeatureVector (in-memory + Parquet)
+             (ofi_l1..l5, spread_bps, microprice, depth_imbalance, vol_1/5/30s)                          
+                                                                                                         
+  Step 4  →  KalmanState
+             (x_hat=[market_pressure, regime], P=2x2 covariance)                                         
+                                                                                                         
+  Step 5  →  Action (WAIT / PASSIVE / AGGRESSIVE)
+                                                                                                         
+  Step 6  →  FillResult → scalar loss → policy weight update                                             
+             (fill_price, slippage, adverse_move logged to execution_log/)
+                                                                                                         
+  ---             
+  Key Interfaces (signatures that lock in the contracts)                                                 
+                                                                                                         
+  # book/order_book.py
+  class OrderBook:                                                                                       
+      def apply_snapshot(self, snapshot: dict) -> None
+      def apply_depth_update(self, event: dict) -> bool  # False = gap                                   
+      def best_bid(self) -> PriceLevel                                                                   
+      def best_ask(self) -> PriceLevel                                                                   
+      def levels(self, side: str, n: int) -> list[PriceLevel]                                            
+                                                                                                         
+  # features/feature_pipeline.py
+  @dataclass                                                                                             
+  class FeatureVector:
+      ts_ms: int; symbol: str
+      ofi_l1..l5: float; spread_bps: float; microprice: float                                            
+      depth_imbalance: float; vol_1s: float; vol_5s: float; vol_30s: float
+                                                                                                         
+  # state/kalman_filter.py
+  class MarketKalmanFilter:                                                                              
+      def predict(self) -> KalmanState
+      def update(self, obs: FeatureVector) -> KalmanState
+                                                                                                         
+  # policy/hedge.py
+  class HedgePolicy:                                                                                     
+      def select(self, context: PolicyContext) -> Action
+      def update(self, action: Action, loss: float) -> None                                              
+      def save(self, path: Path) -> None                                                                 
+                                                                                                         
+  # execution/loss.py                                                                                    
+  def compute_loss(fill: FillResult, arrival_mid: float,
+                   exit_mid: float, lambda_risk: float) -> float                                         
+                                                                                                         
+  ---                                                                                                    
+  New Dependencies to Add to requirements.txt                                                            
+                                                                                                         
+  numpy>=1.26
+  scipy>=1.12                                                                                            
+  sortedcontainers>=2.4   # critical for OrderBook
+  pyarrow>=15.0           # Parquet I/O                                                                  
+  pandas>=2.2
+  pytest>=8.0                                                                                            
+                  
+  ---                                                                                                    
+  Build Order (what to implement first)
+                                                                                                         
+  ┌──────────┬───────────────────────────────┬────────────────────────────────────────────────────┐
+  │ Priority │            Module             │                        Why                         │      
+  ├──────────┼───────────────────────────────┼────────────────────────────────────────────────────┤      
+  │ 1        │ utils/config.py + utils/io.py │ Everything depends on these                        │
+  ├──────────┼───────────────────────────────┼────────────────────────────────────────────────────┤      
+  │ 2        │ book/order_book.py            │ Central data structure — all features depend on it │      
+  ├──────────┼───────────────────────────────┼────────────────────────────────────────────────────┤
+  │ 3        │ book/book_builder.py          │ Produces BookSnapshot that feeds steps 3–7         │      
+  ├──────────┼───────────────────────────────┼────────────────────────────────────────────────────┤      
+  │ 4        │ features/ (all 4 + pipeline)  │ Produces FeatureVector that feeds state/policy     │
+  ├──────────┼───────────────────────────────┼────────────────────────────────────────────────────┤      
+  │ 5        │ state/kalman_filter.py        │ First "inference" module                           │
+  ├──────────┼───────────────────────────────┼────────────────────────────────────────────────────┤      
+  │ 6        │ policy/                       │ Action selection                                   │
+  ├──────────┼───────────────────────────────┼────────────────────────────────────────────────────┤      
+  │ 7        │ execution/                    │ Simulation + loss + update loop                    │
+  └──────────┴───────────────────────────────┴────────────────────────────────────────────────────┘      
+   
+  ---                                                                                                    
+         

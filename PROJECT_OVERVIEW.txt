@@ -1,0 +1,696 @@
+================================================================================
+  ADVERSITY IS CONTROLLABLE — PROJECT OVERVIEW
+  Adaptive Decision Engine for BTC/USDT Market Microstructure
+  Written: April 7, 2026
+================================================================================
+
+--------------------------------------------------------------------------------
+  WHAT THIS PROJECT IS (AND IS NOT)
+--------------------------------------------------------------------------------
+
+This is NOT a price prediction system. We are not trying to guess where Bitcoin
+will go. We are building something more interesting: an adaptive execution
+engine that learns HOW to act in a market, not WHERE prices will move.
+
+The core question is: given what we can observe about the market right now
+(order flow, book shape, volatility), what is the smartest action to take
+in order to minimize execution cost and decision error over time?
+
+The three possible actions we are deciding between:
+  - WAIT       → do nothing, let the market evolve
+  - PASSIVE    → post a limit order (sit on the spread, may not fill)
+  - AGGRESSIVE → hit the market (fill immediately, pay the spread)
+
+To answer that question we combine two classical systems:
+  1. Kalman Filter   — estimates hidden market state (pressure + regime)
+  2. Hedge Algorithm — regret-minimizing policy that picks the best action
+
+Right now, Steps 1–3 are complete. We have data flowing, books reconstructed,
+and features computed. Steps 4–7 (state estimation, policy, simulation) are
+next.
+
+--------------------------------------------------------------------------------
+  THE CODEBASE — FILE BY FILE
+--------------------------------------------------------------------------------
+
+Every file lives under src/ or scripts/. The principle is: scripts are thin
+entry points, all real logic lives in src/.
+
+════════════════════════════════════════════════════════════════════════════════
+  STEP 1 — INGEST (getting data from Binance)
+════════════════════════════════════════════════════════════════════════════════
+
+  src/ingest/ws_ingest.py
+  -----------------------
+  What it does:
+    Opens a persistent WebSocket connection to Binance and listens to two live
+    streams simultaneously: every trade that executes on BTC/USDT, and every
+    change to the order book depth (at 100ms resolution). Each event is
+    cleaned up (normalized) and written to disk.
+
+  How it does it:
+    Uses Python's asyncio + websockets library to maintain a long-running
+    connection. If the connection drops, it automatically reconnects after 5
+    seconds. Events arrive as JSON and are written one line at a time to .jsonl
+    files, organized by hour (hour=04/events.jsonl, hour=05/events.jsonl, etc.)
+
+  Why it matters:
+    This is our data source. Without this running, there is no signal. The two
+    streams we subscribe to are:
+      - btcusdt@trade      → every single trade: price, quantity, direction
+      - btcusdt@depth@100ms → which price levels in the book changed and by how much
+
+  Key output fields (trades):
+    event_time_ms, price, qty, is_buyer_maker (true = seller hit the bid)
+
+  Key output fields (depth updates):
+    first_update_id, final_update_id (for continuity checking), bids[], asks[]
+    Each bid/ask entry is [price, new_quantity] — if quantity is 0, that level
+    was removed from the book.
+
+  ---
+
+  src/ingest/rest_snapshot.py
+  ---------------------------
+  What it does:
+    Takes a one-time HTTP snapshot of the full order book state from Binance's
+    REST API. This is needed to initialize the book before we can replay
+    incremental updates from the WebSocket.
+
+  How it does it:
+    Calls the Binance REST depth endpoint and saves the result as a JSON file,
+    timestamped in the filename, under data/raw/depth_snapshots/.
+
+  Why it matters:
+    The WebSocket depth stream is a differential feed — it only tells you what
+    changed, not the full state. You cannot reconstruct the book from diffs alone
+    without knowing the starting state. This snapshot is the "seed."
+
+════════════════════════════════════════════════════════════════════════════════
+  STEP 2 — ORDER BOOK (reconstructing the live book from raw events)
+════════════════════════════════════════════════════════════════════════════════
+
+  src/book/order_book.py
+  ----------------------
+  What it does:
+    An in-memory limit order book (LOB). It holds two sorted lists of price
+    levels — all bids (buy orders) sorted highest-first, and all asks (sell
+    orders) sorted lowest-first — and keeps them up to date as new events arrive.
+
+  How it does it:
+    Uses a SortedDict (sorted dictionary) for both sides. Bids are stored with
+    negated price keys so the best (highest) bid is always at index 0. This
+    gives O(log n) insert/delete at any price level and O(1) access to best bid
+    and best ask — which is critical because Binance updates arrive at arbitrary
+    price levels hundreds of times per second.
+
+    When a depth update arrives, for each price level:
+      - If new quantity > 0: update or add that price level
+      - If new quantity = 0: remove that price level (it was fully consumed)
+
+    It also checks for sequence gaps: Binance assigns monotonically increasing
+    update IDs to every event. If an event arrives with a gap in those IDs, it
+    means we missed events — the book may be stale. This is flagged.
+
+  Why it matters:
+    This is the central data structure of the whole project. Everything downstream
+    depends on having an accurate, up-to-date picture of the order book. Without
+    this, our features are meaningless.
+
+  Key output type: BookSnapshot
+    A compact read-only snapshot of the top-20 price levels on each side at a
+    given moment. This is what gets passed to the feature pipeline.
+
+  ---
+
+  src/book/book_builder.py
+  ------------------------
+  What it does:
+    Orchestrates the replay process. Seeds the OrderBook from a REST snapshot,
+    then feeds it incremental depth update events one by one in chronological
+    order, and emits a BookSnapshot every 10 events (~1 second).
+
+  How it does it:
+    Reads depth update events from JSONL files on disk in time order. For each
+    event, applies it to the OrderBook. Every 10 events, takes a snapshot and
+    yields it downstream. If a sequence gap is detected, it emits a snapshot
+    immediately and flags it so downstream code can decide whether to skip it.
+
+  Why it matters:
+    This is the "playback engine" — it turns raw stored events back into a
+    simulated live book. Without it, our JSONL files are just JSON sitting on
+    disk. With it, we can replay market microstructure as if we were watching
+    it happen in real time.
+
+════════════════════════════════════════════════════════════════════════════════
+  STEP 3 — FEATURES (extracting signal from the book)
+════════════════════════════════════════════════════════════════════════════════
+
+  This is the core signal extraction layer. We take each BookSnapshot and
+  compute a set of numbers that characterize the current state of the market.
+  These numbers are the inputs to the Kalman filter in Step 4.
+
+  ---
+
+  src/features/spread.py
+  ----------------------
+  What it does:
+    Computes price and spread information from the top of the book.
+
+  Outputs:
+    - best_bid_px / best_ask_px  — the current best prices to buy and sell at
+    - spread_abs                 — the gap between them in USDT (e.g., $1.20)
+    - spread_bps                 — that same gap as basis points of mid price
+                                   (e.g., 1.8 bps means very tight, liquid market)
+    - mid_price                  — simple average of best bid and best ask
+    - microprice                 — quantity-weighted mid price
+
+  The microprice is the interesting one. If the best bid has 0.1 BTC sitting on
+  it and the best ask has 10 BTC, the bid is much thinner and more likely to be
+  consumed first — meaning price is more likely to fall. Microprice accounts for
+  this by weighting the midpoint toward the thinner side. It is a better short-
+  term price estimate than simple mid.
+
+  ---
+
+  src/features/ofi.py
+  -------------------
+  What it does:
+    Computes Order Flow Imbalance (OFI) — a measure of the net pressure at each
+    price level by comparing two consecutive snapshots.
+
+  How it works:
+    For each of the top 5 price levels:
+      OFI_i = (how much bid quantity changed at level i)
+            - (how much ask quantity changed at level i)
+
+    If OFI is positive, buy pressure increased or sell pressure decreased.
+    If OFI is negative, the opposite.
+
+  Why it matters:
+    OFI is one of the strongest short-term predictors of price movement in
+    market microstructure research (Bouchaud et al.). It captures the flow of
+    orders hitting the book, which tends to lead price changes by fractions of
+    a second. We compute it across 5 levels (L1 through L5) rather than just
+    the top because deeper levels can signal institutional accumulation before
+    it shows up at L1.
+
+  ---
+
+  src/features/imbalance.py
+  -------------------------
+  What it does:
+    Computes a single number in the range (-1, +1) summarizing the shape of
+    the entire top-10 book in one shot.
+
+  Formula:
+    imbalance = (total bid quantity - total ask quantity)
+              / (total bid quantity + total ask quantity)
+
+    +1.0 = all liquidity is on the buy side (strong upward pressure)
+    -1.0 = all liquidity is on the sell side (strong downward pressure)
+     0.0 = perfectly balanced
+
+  Volume weighting:
+    Levels far from the mid price are less likely to trade and should count
+    less. We apply a linear decay: level 1 counts the most, level 10 the least.
+
+  Why it matters:
+    Gives the Kalman filter a normalized, single-number view of directional
+    pressure across the whole visible book. Unlike OFI (which is a delta),
+    depth imbalance is a point-in-time measure.
+
+  ---
+
+  src/features/volatility.py
+  --------------------------
+  What it does:
+    Maintains a rolling buffer of mid prices and computes realized volatility
+    over three time windows: 1 second, 5 seconds, and 30 seconds.
+
+  How it works:
+    At each tick, computes log(current_mid / previous_mid) and adds it to a
+    time-indexed buffer. Volatility for each window = standard deviation of log
+    returns within that window. If fewer than 3 samples are in a window, returns
+    0.0 (window not yet populated).
+
+  Why three windows?
+    - vol_1s  → captures microstructure noise and sudden spikes
+    - vol_5s  → medium-term regime signal
+    - vol_30s → slow trend / regime context
+
+    Together they let the Kalman filter distinguish:
+      "Calm" (all low) vs "Spike" (high 1s, low 30s) vs "Trending" (all rising)
+
+  ---
+
+  src/features/feature_pipeline.py
+  ---------------------------------
+  What it does:
+    The orchestrator. Takes a stream of BookSnapshots and calls each of the
+    four feature modules above, assembling the results into a single flat
+    FeatureVector. Writes them to Parquet files on disk.
+
+  How it works:
+    It is stateful: it holds a reference to the previous snapshot (needed for
+    OFI deltas) and maintains the RollingVolatility buffer across ticks. This
+    means it must be created once and fed snapshots in order — not reset between
+    ticks.
+
+  Output: FeatureVector (one row per ~1 second tick)
+    ts_ms, symbol, best_bid_px, best_ask_px, spread_abs, spread_bps,
+    mid_price, microprice, ofi_l1..l5, depth_imbalance, vol_1s, vol_5s,
+    vol_30s, sequence_gap
+
+  Storage format: Apache Parquet
+    Column-oriented, compressed, schema-enforced. PyArrow validates types at
+    write time so a badly typed value raises an error immediately rather than
+    silently corrupting the file.
+
+════════════════════════════════════════════════════════════════════════════════
+  UTILITIES (supporting infrastructure)
+════════════════════════════════════════════════════════════════════════════════
+
+  src/utils/io.py
+  ---------------
+  Lazy JSONL reader (iter_jsonl): opens a file and yields one parsed JSON
+  object per line without loading everything into memory. Also handles reading
+  entire directory trees in order (iter_jsonl_dir). Parquet write wrapper
+  (write_parquet) that enforces schema.
+
+  src/utils/time_utils.py
+  -----------------------
+  Timestamp helpers: utc_now_ms (current time in milliseconds), hour_partition
+  (convert timestamp to "2026-03-23" + "04"), align_to_grid (snap a timestamp
+  to the nearest N-millisecond boundary).
+
+  src/utils/config.py
+  -------------------
+  Loads YAML config files and validates them against a typed Python dataclass.
+  This means if a config field is missing or wrong type, you get a clear error
+  at startup rather than a mysterious crash later.
+
+  src/utils/logging.py
+  --------------------
+  Thin wrapper around Python's standard logger. get_logger(__name__) gives each
+  module its own named logger that outputs structured lines to stdout.
+
+════════════════════════════════════════════════════════════════════════════════
+  CONFIG FILES
+════════════════════════════════════════════════════════════════════════════════
+
+  configs/binance_btcusdt.yaml
+  ----------------------------
+  Exchange and stream settings: symbol, which WebSocket streams to subscribe to,
+  reconnect behavior.
+
+  configs/book.yaml
+  -----------------
+  Order book settings: how many price levels to keep (top_n_levels = 20), how
+  often to emit a snapshot (snapshot_every_n_events = 10 → ~1 second cadence).
+
+  configs/features.yaml
+  ---------------------
+  Feature extraction parameters: OFI levels (5), depth imbalance levels (10),
+  whether to apply volume weighting (yes), output directory for Parquet files.
+
+════════════════════════════════════════════════════════════════════════════════
+  ENTRY POINT SCRIPTS
+════════════════════════════════════════════════════════════════════════════════
+
+  scripts/1_ingest_ws.py
+  ----------------------
+  Start the WebSocket ingestion loop. Keep this running in a terminal. It never
+  stops on its own — Ctrl+C to kill it. All raw data flows through here.
+
+  scripts/3_featuregen.py
+  -----------------------
+  Run the book build + feature generation together in one pass. Takes the REST
+  snapshot and all depth update JSONL files, reconstructs the book, extracts
+  features, and writes Parquet files. Run this after collecting data.
+  (Scripts 2 is for debugging book state in isolation only.)
+
+--------------------------------------------------------------------------------
+  OUR DATA — RAW AND DERIVED
+--------------------------------------------------------------------------------
+
+════════════════════════════════════════════════════════════════════════════════
+  RAW DATA (data/raw/)
+════════════════════════════════════════════════════════════════════════════════
+
+  Location: data/raw/
+  Format: JSONL (one JSON object per line)
+  Partition: date=YYYY-MM-DD/hour=HH/events.jsonl (Hive-style partitioning)
+
+  data/raw/trades/
+  ----------------
+  Every single executed trade on Binance BTC/USDT spot market.
+  Coverage: March 23, 2026 (04:00 UTC) through April 7–8, 2026
+  Total: approximately 16 days of continuous data
+  Volume: BTC/USDT is one of the most liquid markets in the world —
+          expect thousands of trades per hour, possibly tens of thousands
+          during active sessions.
+
+  Each event contains:
+    event_time_ms    — when Binance timestamped the trade (exchange time)
+    price            — execution price in USDT (e.g., 68304.53)
+    qty              — quantity traded in BTC (e.g., 0.00178 BTC ≈ $121)
+    is_buyer_maker   — TRUE if the seller was the aggressor (sell hit the bid)
+                       FALSE if the buyer was the aggressor (buy hit the ask)
+    trade_time_ms    — exchange-confirmed trade time
+    recv_time_ms     — when our machine received the event (latency baseline)
+
+  The is_buyer_maker flag is crucial: it tells us who was aggressive (taker)
+  vs passive (maker). Sustained sequences of buyer aggression (is_buyer_maker=false)
+  signal upward momentum.
+
+  data/raw/depth_updates/
+  -----------------------
+  Every change to the visible order book, at 100ms resolution.
+  Coverage: same as trades (March 23 – April 7/8, 2026)
+
+  Each event contains:
+    first_update_id  — first sequence number covered by this update
+    final_update_id  — last sequence number (used for gap detection)
+    bids             — list of [price, new_quantity] for changed bid levels
+    asks             — list of [price, new_quantity] for changed ask levels
+    (quantity = 0 means that price level was removed from the book)
+
+  data/raw/depth_snapshots/
+  -------------------------
+  Point-in-time full REST snapshots of the order book. We captured several of
+  these on March 23. They are used to seed the OrderBook before replay.
+
+  BTC price at the time of first snapshot: approximately $68,304 USDT.
+
+════════════════════════════════════════════════════════════════════════════════
+  DERIVED DATA (data/derived/)
+════════════════════════════════════════════════════════════════════════════════
+
+  data/derived/features/
+  ----------------------
+  Format: Apache Parquet (columnar, compressed, schema-enforced)
+  Partition: date=2026-03-23/hour=04/features.parquet
+
+  Currently processed: March 23, 2026 — hour 04 and hour 05 (two hours only)
+  The rest of the raw data (16 days) has NOT yet been processed through
+  featuregen. Only two hours of features exist on disk so far.
+
+  Each Parquet row is one FeatureVector (~1 second of market state):
+
+  Column          | Type    | What it means
+  ----------------+---------+----------------------------------------------
+  ts_ms           | int64   | Timestamp in milliseconds (UTC)
+  symbol          | string  | Always "BTCUSDT" for now
+  best_bid_px     | float64 | Best price someone is willing to buy at
+  best_ask_px     | float64 | Best price someone is willing to sell at
+  spread_abs      | float64 | Gap between them in USDT (e.g., $1.50)
+  spread_bps      | float64 | That gap as basis points (e.g., 2.2 bps)
+  mid_price       | float64 | Simple average of bid and ask
+  microprice      | float64 | Quantity-weighted mid (better price signal)
+  ofi_l1          | float64 | Order flow imbalance at level 1 (best bid/ask)
+  ofi_l2          | float64 | Order flow imbalance at level 2
+  ofi_l3          | float64 | Order flow imbalance at level 3
+  ofi_l4          | float64 | Order flow imbalance at level 4
+  ofi_l5          | float64 | Order flow imbalance at level 5
+  depth_imbalance | float64 | Net book pressure in (-1, +1)
+  vol_1s          | float64 | 1-second realized volatility
+  vol_5s          | float64 | 5-second realized volatility
+  vol_30s         | float64 | 30-second realized volatility
+  sequence_gap    | bool    | True if a gap was detected in that tick
+
+--------------------------------------------------------------------------------
+  WHAT WE OBSERVED (LIMITED PRELIMINARY DATA)
+--------------------------------------------------------------------------------
+
+We ran the ingest pipeline starting on March 23, 2026 with BTC/USDT trading
+at approximately $68,304. We processed features for two hours of data from
+that session (hours 04–05 UTC, i.e., early morning UTC).
+
+Raw data has continued collecting continuously since then through April 7/8,
+giving us roughly 16 days of raw tick data — but the feature generation step
+has only been run on the initial 2 hours.
+
+Key observations from that limited run:
+
+  Market regime at capture time:
+    BTC was in a relatively calm period at ~$68,300 range. Trades were small
+    (many in the 0.001–0.002 BTC range), suggesting retail or algorithmic
+    fragmentation rather than large institutional blocks.
+
+  Order book behavior:
+    Depth updates arrived at 100ms cadence as expected. The book showed
+    normal BTC/USDT liquidity — tight spread (typically 1–3 bps on a $68K
+    asset, meaning $0.70–$2 per BTC), and multiple price levels actively
+    moving on each update.
+
+  Sequence gaps:
+    Some sequence gaps were detected during replay, which is normal — this
+    can happen from brief WebSocket lag. These ticks are flagged in the
+    features via sequence_gap=True and can be filtered out downstream.
+
+  NOTE: With only 2 hours of features computed, we cannot yet make meaningful
+  statistical claims about regime distributions, OFI predictive power, or
+  volatility patterns. That analysis requires processing the full 16 days
+  of raw data through featuregen first.
+
+Since then (April 7), the price has moved. The 16-day dataset will capture
+meaningful market movement — we just have not yet run the feature pipeline
+over it. That is the first thing to do next.
+
+--------------------------------------------------------------------------------
+  THE PIPELINE AT A GLANCE — HOW EVERYTHING CONNECTS
+--------------------------------------------------------------------------------
+
+  [ Binance WS ] → trades.jsonl + depth_updates.jsonl   (Step 1: ingest)
+       ↓
+  [ OrderBook ]  → BookSnapshot every ~1 second          (Step 2: book)
+       ↓
+  [ Features ]   → FeatureVector (17 numbers)            (Step 3: features)
+       ↓
+  [ Kalman ]     → KalmanState [market_pressure, regime] (Step 4: state — NEXT)
+       ↓
+  [ Hedge ]      → Action: WAIT / PASSIVE / AGGRESSIVE   (Step 5: policy — NEXT)
+       ↓
+  [ Simulator ]  → FillResult → scalar loss              (Step 6: execution — NEXT)
+       ↓
+  [ Updater ]    → policy weights updated                (Step 7: loop — NEXT)
+
+The first three steps convert messy real-time market data into clean, structured
+numbers. Steps 4–7 are the intelligence layer — they take those numbers and
+make decisions that get better over time through regret minimization.
+
+--------------------------------------------------------------------------------
+  NEXT STEPS — WHAT TO BUILD
+--------------------------------------------------------------------------------
+
+The pipeline has been thoroughly sanitized and is ready to move into the
+intelligence layer. Here is the recommended build order:
+
+════════════════════════════════════════════════════════════════════════════════
+  IMMEDIATE — Run featuregen over all data we have
+════════════════════════════════════════════════════════════════════════════════
+
+Before building anything new, run scripts/3_featuregen.py over the full
+16-day dataset (March 23 – April 7). Right now features only exist for 2 hours.
+
+Why first: The Kalman filter needs to be calibrated on real feature distributions.
+You cannot set noise parameters without knowing the scale and variance of OFI,
+spread_bps, and depth_imbalance in your actual data.
+
+Also: now is a good time to add a simple inspection script or notebook that
+loads the feature Parquet files and shows you summary statistics —
+mean/std of each feature, distribution of depth_imbalance, OFI correlation
+with next-tick price move, etc. This is not strictly necessary for building
+the next steps but it will deeply inform how you set Kalman parameters.
+
+════════════════════════════════════════════════════════════════════════════════
+  STEP 4 — Kalman Filter  (src/state/kalman_filter.py)
+════════════════════════════════════════════════════════════════════════════════
+
+What it will do:
+  Estimate two hidden quantities at every tick:
+    x_hat[0] = market_pressure (net directional force — how hard the market
+                                is pushing in one direction right now)
+    x_hat[1] = regime          (volatility regime — calm vs turbulent)
+
+  These are not directly observable. The Kalman filter infers them from what
+  IS observable — our FeatureVector. Think of it like a GPS: you can't see
+  your exact position, but you can estimate it from satellite signals with
+  known noise. Kalman is optimal at this under Gaussian noise assumptions.
+
+How it will work:
+  Standard linear Kalman filter in 2D state space.
+    - State transition: F matrix (how state evolves from tick to tick)
+    - Observation: H matrix (which features best reflect the hidden state)
+    - Process noise: Q (how much the state can jump between ticks)
+    - Observation noise: R (how noisy our feature measurements are)
+
+  Observations fed in: ofi_l1 through ofi_l5, depth_imbalance, microprice
+  (these are the features most theoretically connected to market pressure)
+
+  Output per tick: KalmanState(ts_ms, x_hat[2], P[2x2], innovation)
+    P is the 2x2 uncertainty covariance — tells us how confident the filter is.
+    innovation is the surprise term: how far the observation was from predicted.
+
+Key design decisions to make:
+  - What to use as the observation vector (subset of FeatureVector)
+  - Initial values for F, H, Q, R (will need tuning against real data)
+  - Whether to normalize features before feeding to the filter
+
+Files to create:
+  src/state/kalman_filter.py
+  src/state/__init__.py
+  configs/kalman.yaml
+  scripts/4_run_kalman.py
+
+════════════════════════════════════════════════════════════════════════════════
+  STEP 5 — Hedge Policy  (src/policy/)
+════════════════════════════════════════════════════════════════════════════════
+
+What it will do:
+  Given the current market state (KalmanState + FeatureVector), select one
+  of three actions: WAIT, PASSIVE, AGGRESSIVE.
+
+  The Hedge algorithm (also called Multiplicative Weights / Exponential
+  Weights) is a classical online learning algorithm with provable regret
+  bounds. It does not require a model of the market — it simply tracks which
+  actions have been working and gives them more weight.
+
+How it will work:
+  Maintain a weight vector w = [w_WAIT, w_PASSIVE, w_AGGRESSIVE].
+  Initially uniform (0.33, 0.33, 0.33).
+
+  Select action: proportional to weights (randomized selection).
+
+  After each action, observe the loss (computed in Step 6) and update:
+    w(a) ← w(a) * exp(-η * L(a))
+
+  where η (eta) is the learning rate and L(a) is the realized loss for
+  that action. Actions with high loss get exponentially down-weighted.
+  Over time the distribution concentrates on the best action.
+
+Files to create:
+  src/policy/actions.py    (Action enum: WAIT / PASSIVE / AGGRESSIVE)
+  src/policy/hedge.py      (weight vector, select(), update(), save())
+  src/policy/__init__.py
+  configs/policy.yaml      (eta, initial weights)
+  scripts/5_run_policy.py
+
+════════════════════════════════════════════════════════════════════════════════
+  STEPS 6+7 — Simulation + Loss + Outer Loop  (src/execution/)
+════════════════════════════════════════════════════════════════════════════════
+
+What it will do:
+  Given an action from the policy, simulate what would have happened if we
+  executed it against the real order book. Compute a loss (how bad was the
+  outcome). Feed that loss back to the policy for its weight update.
+  Repeat for every tick in the dataset.
+
+  This is the closing of the loop. It turns the Kalman + Hedge stack into
+  an adaptive system that learns from its own simulated decisions.
+
+Execution logic:
+  WAIT:       No fill. Loss = price move away from us (opportunity cost if
+              the market moves against our eventual direction).
+  PASSIVE:    Simulate a limit order at the best bid/ask. Fills if the market
+              crosses that price during the next window; does not fill otherwise.
+              If filled: loss = slippage (how far from mid) + adverse move.
+  AGGRESSIVE: Simulate a market order. Always fills immediately at best ask
+              (buy) or best bid (sell). Loss = spread paid + adverse move.
+
+Loss formula:
+  L = slippage + λ * adverse_move
+  where:
+    slippage     = |fill_price - arrival_mid|
+    adverse_move = |exit_mid - arrival_mid| * direction_penalty
+    λ            = risk aversion parameter (how much we penalize adverse moves
+                   relative to slippage)
+
+Files to create:
+  src/execution/simulator.py   (fill simulation against LOB)
+  src/execution/loss.py        (loss formula)
+  src/execution/updater.py     (outer loop: all steps 4–7 together)
+  src/execution/__init__.py
+  scripts/6_simulate_and_update.py
+
+════════════════════════════════════════════════════════════════════════════════
+  LATER — Analysis and Evaluation
+════════════════════════════════════════════════════════════════════════════════
+
+After the full loop is running, the interesting questions become:
+
+  1. Does the policy converge?
+     Watch the weight vector over time. Does it stop being uniform and start
+     concentrating on one or two actions? Does the distribution change across
+     market regimes (calm vs volatile)?
+
+  2. Does Kalman state track real regimes?
+     Plot x_hat[1] (regime estimate) against realized volatility from the
+     features. Do they correlate?
+
+  3. Does the policy agree with market outcomes?
+     Periods where AGGRESSIVE is preferred should correlate with high OFI
+     and directional imbalance. WAIT periods should cluster around low-vol,
+     mean-reverting regimes.
+
+  4. Robustness check:
+     Does the system behave well during known events in our 16-day window?
+     What happened during any high-volatility periods? Did the Kalman filter
+     detect the regime shift? Did the policy react?
+
+  5. Extend to other instruments:
+     The entire pipeline is symbol-agnostic. ETH/USDT, SOL/USDT — same code,
+     different config file.
+
+--------------------------------------------------------------------------------
+  HOW TO PICK UP FROM HERE (RUN ORDER)
+--------------------------------------------------------------------------------
+
+Assuming ingestion is already running or you have enough data:
+
+  # 1. Process all raw data into features (run once, takes a few minutes)
+  python scripts/3_featuregen.py
+
+  # 2. Inspect the features (optional but recommended before Step 4)
+  # Write a quick script or notebook: load all feature Parquet files with
+  # pandas, print describe(), plot distributions, check OFI range.
+
+  # 3. Build and test the Kalman filter
+  python scripts/4_run_kalman.py
+  # Start with default noise parameters, tune until state makes intuitive sense.
+
+  # 4. Build and test the Hedge policy
+  python scripts/5_run_policy.py
+  # Initial weights uniform. Verify select() and update() work.
+
+  # 5. Run the full loop
+  python scripts/6_simulate_and_update.py
+  # This replays all processed data and produces execution_log/
+
+  # 6. Analyze results from execution_log/
+
+================================================================================
+  SUMMARY TABLE
+================================================================================
+
+  Component               | Status    | Files
+  ------------------------+-----------+------------------------------------------
+  Data ingestion (WS)     | DONE      | src/ingest/ws_ingest.py
+  REST snapshot           | DONE      | src/ingest/rest_snapshot.py
+  Order book (LOB)        | DONE      | src/book/order_book.py
+  Book builder (replay)   | DONE      | src/book/book_builder.py
+  Spread features         | DONE      | src/features/spread.py
+  OFI features            | DONE      | src/features/ofi.py
+  Depth imbalance         | DONE      | src/features/imbalance.py
+  Rolling volatility      | DONE      | src/features/volatility.py
+  Feature pipeline        | DONE      | src/features/feature_pipeline.py
+  Utilities               | DONE      | src/utils/{io,time_utils,config,logging}.py
+  Raw data (trades)       | DONE      | data/raw/trades/ (March 23 – April 7)
+  Raw data (depth)        | DONE      | data/raw/depth_updates/ (same)
+  Derived features        | PARTIAL   | data/derived/features/ (2 hours only)
+  Kalman filter           | NOT BUILT | src/state/kalman_filter.py
+  Hedge policy            | NOT BUILT | src/policy/{actions,hedge}.py
+  Execution simulator     | NOT BUILT | src/execution/{simulator,loss,updater}.py
+
+================================================================================

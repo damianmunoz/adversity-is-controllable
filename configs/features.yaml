@@ -1,0 +1,5 @@
+# Feature extraction settings
+ofi_levels: 5                       # how many price levels to compute OFI across
+imbalance_levels: 10                # how many levels for depth imbalance
+volume_weighted_imbalance: true     # apply linear decay weights to deeper levels
+output_dir: data/derived/features   # where to write feature Parquet files

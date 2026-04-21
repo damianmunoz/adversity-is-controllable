@@ -1,0 +1,674 @@
+================================================================================
+ SANITY CHECK & RECOVERY REPORT — 2026-04-21
+ adversity-is-controllable — BTC/USDT adaptive execution engine
+================================================================================
+
+Scope: catastrophic book-corruption bug, root-cause fix, clean re-ingest,
+full end-to-end step-6 run, Kalman R recalibration, λ retuning, and
+counterfactual savings analysis against fixed-strategy baselines.
+
+
+================================================================================
+ 1. THE BUG — what we found and why
+================================================================================
+
+Symptom
+-------
+Step 6 on ~244k features collapsed to:
+    Final weights — WAIT: 0.0000  PASSIVE: 0.0000  AGGRESSIVE: 1.0000
+Policy chose AGGRESSIVE 100% of the time — clearly wrong for any healthy
+market-making / execution policy.
+
+Root cause (two-layer)
+----------------------
+Shell inspection of the features parquet showed mid_price > best_ask for
+~98% of rows. Walking back through the pipeline:
+
+  Layer 1 (data):
+    During early ingestion, the Binance WebSocket disconnected mid-stream.
+    Depth updates were dropped during the outage. The local order book was
+    never re-synced against a fresh REST snapshot, so many price levels
+    carried stale quantities. Post-outage, best_bid and best_ask came from
+    those stale levels while new updates landed elsewhere in the book.
+    Net effect: a chronically misaligned book.
+
+  Layer 2 (logic):
+    `src/book/book_builder.py` on a sequence gap flagged `sequence_gap=True`
+    only on the FIRST emission after the gap and then continued applying
+    deltas as if the book were fine. Every subsequent snapshot was stamped
+    `sequence_gap=False` even though the underlying book was corrupted.
+    Filtering `sequence_gap=True` downstream removed one row — not the
+    7+ hours of silent corruption that followed.
+
+Not a bug in
+  - Hedge algorithm
+  - Kalman filter
+  - Feature math
+Pure garbage-in: features were physically impossible (mid outside [bid,ask]),
+so Hedge rationally learned "PASSIVE fills look free, take them forever" →
+collapsed to AGGRESSIVE because that was the only action whose loss signal
+was remotely sensible in the broken data.
+
+
+================================================================================
+ 2. RECOVERY PROCEDURE EXECUTED
+================================================================================
+
+Data wipe
+---------
+Removed all raw + derived data to start from a known-clean state:
+    rm -rf data/raw/trades data/raw/depth_updates data/raw/depth_snapshots
+    rm -rf data/derived/features data/derived/execution_log
+
+Ingest restart in correct order
+-------------------------------
+1. `caffeinate -disu &`              ← prevent macOS sleep
+2. `python scripts/1_ingest_ws.py`  ← start WS ingest first
+3. wait ~30s for buffered events
+4. `python -m src.ingest.rest_snapshot` ← take snapshot AFTER WS is flowing
+
+This is the Binance-documented sync order. Taking the snapshot first (which
+was the prior mistake) leaves a gap between snapshot.last_update_id and the
+first captured event's first_update_id — the book can never be correctly
+seeded.
+
+Snapshot verification
+---------------------
+New snapshot: snapshot_1776714838088.json
+    last_update_id = 92,380,025,309
+    best bid/ask   = 76230.69 / 76230.70 (spread = $0.01)
+
+    First captured event: first_update_id = 92,379,963,962
+    Last captured event (start):  final_update_id = 92,380,033,574
+    → snapshot.last_update_id is INSIDE the captured event range ✓
+    → textbook Binance sync-protocol correct
+
+
+================================================================================
+ 3. OVERNIGHT RUN + GAP DETECTION
+================================================================================
+
+Left ingest running ~8 hours under caffeinate. Full-stream sequence-ID scan
+on completion:
+
+Total depth events:  652,106
+Time span:           2026-04-20 19:52:21 UTC → 2026-04-21 14:01:53 UTC (18.16h)
+Snapshot sync:       OK — snapshot id inside stream
+Sequence gaps:       2 — both clustered in hour=06 UTC
+
+Gap details (a single WS disconnect with two reconnect hiccups):
+  Gap 1 before: 2026-04-21 06:43:32.514 UTC
+  Gap 1 after:  2026-04-21 06:45:37.314 UTC   outage = 124.80s
+  Gap 2 before: 2026-04-21 06:45:57.114 UTC
+  Gap 2 after:  2026-04-21 06:46:33.414 UTC   outage =  36.30s
+
+Clean pre-gap window:   10.85 hours
+Post-gap "continued":    7.26 hours — BOOK STATE CORRUPTED (same bug pattern),
+                         not usable without mid-run resync
+
+
+================================================================================
+ 4. DATA CLEANUP APPLIED
+================================================================================
+
+Truncation
+----------
+  data/raw/depth_updates/date=2026-04-21/hour=06/events.jsonl: 34,392 → 26,127 lines
+  data/raw/trades/date=2026-04-21/hour=06/events.jsonl:       74,606 → 61,399 lines
+      (time-aligned to depth gap at UTC 06:43:32.514)
+
+Deletion
+--------
+Removed post-gap hours for both streams:
+  data/raw/depth_updates/date=2026-04-21/hour={07,08,09,10,11,12,13,14}
+  data/raw/trades/date=2026-04-21/hour={07,08,09,10,11,12,13,14}
+
+Re-verification (full re-scan of cleaned data)
+----------------------------------------------
+  Post-cleanup depth events:      390,703
+  Sequence gaps:                  0    ← perfectly continuous
+  Snapshot uid inside stream:     ✓
+  Span:     2026-04-20 19:52:21 UTC → 2026-04-21 06:43:32 UTC
+  Duration: 10.85 hours
+
+
+================================================================================
+ 5. CODE PATCHES — GAP SELF-HEAL
+================================================================================
+
+Goal: future overnight runs should automatically recover from WS disconnects
+      instead of silently corrupting. Two files changed.
+
+5.1  src/book/book_builder.py
+-----------------------------
+Old behavior:
+  - Accepted a single snapshot_path
+  - On gap: flagged sequence_gap=True on first emission, kept going
+
+New behavior:
+  - Accepts a snapshot_dir, loads all snapshots chronologically at run start
+  - Holds snapshots[0] as seed, snapshots[1:] in reserve for recovery
+  - On gap detected (first_update_id > last_update_id + 1):
+      1. search remaining snapshots for one with
+         last_update_id + 1 >= first_update_id  (i.e., bridges the gap)
+      2. if found → reseed, set self.corrupted = False → continue cleanly
+      3. if none  → set self.corrupted = True, keep applying deltas but emit
+                   every subsequent snapshot with sequence_gap=True until
+                   a fresh snapshot eventually appears
+  - Output contract unchanged — existing filter downstream still works, and
+    now sequence_gap=True is honest across the entire corrupted region.
+
+New helper: `list_snapshots(snapshot_dir, symbol)` returns all snapshots in
+chronological order (filename carries utc_ms).
+
+5.2  src/ingest/ws_ingest.py
+----------------------------
+Added concurrent periodic REST snapshotting so the self-heal logic actually
+has material to recover from.
+
+  WSIngestConfig.snapshot_interval_sec = 900.0    # 15 min, configurable
+  WSIngestConfig.symbol               = "BTCUSDT"
+
+  async def snapshot_periodically(config):
+      # dispatches the sync REST call to an executor so it doesn't block
+      # the WS event loop. On failure, logs and retries next interval.
+
+  main() now runs:
+      await asyncio.gather(
+          consume_forever(config),
+          snapshot_periodically(config),
+      )
+
+5.3  scripts/3_featuregen.py
+----------------------------
+Updated to pass SNAPSHOT_DIR to the new builder API.
+Swapped `find_latest_snapshot` for `list_snapshots` so startup log shows
+how many snapshots are available.
+
+
+================================================================================
+ 6. CLEAN FEATURE REGENERATION — SANITY CHECKS
+================================================================================
+
+Generated 38,973 feature rows from the 10.85h clean window.
+
+=== Feature-level sanity (all rows, all hours) ===
+
+  1. mid_price <= best_ask_px:    PASS  violations = 0/38,973 (0.0000%)
+  2. mid_price >= best_bid_px:    PASS  violations = 0/38,973 (0.0000%)
+  3. spread_abs > 0:              PASS  violations = 0/38,973 (0.0000%)
+  4. best_ask_px > best_bid_px:   PASS  violations = 0/38,973 (0.0000%)
+  5. microprice <= best_ask_px:   PASS  violations = 0/38,973 (0.0000%)
+  6. microprice >= best_bid_px:   PASS  violations = 0/38,973 (0.0000%)
+  7. sequence_gap=True rows:      0/38,973 (0.0000%)
+
+Compare to the broken dataset: 98% of rows had mid > ask.
+
+=== Observed ranges (clean window) ===
+
+  best_bid_px:      75,491.26 → 76,556.86
+  best_ask_px:      75,491.27 → 76,556.87
+  spread_abs:       min=0.0100  median=0.0100  max=8.1100  std=0.0527
+  spread_bps:       min=0.0013  median=0.0013  max=1.0708
+  vol_5s:           min=0      median=0      max=7.14e-4   (sparse — see §7)
+  depth_imbalance:  min=-0.9998  median=-0.0679  max=+0.9999
+  ofi_l1:           min=-32.63  median=-0.0000  max=+39.59
+
+
+================================================================================
+ 7. STEP 6 EXECUTION — FIRST CLEAN END-TO-END RUN
+================================================================================
+
+Invocation output
+-----------------
+  [6_simulate_and_update] INFO Starting run — λ=0.50 η=0.100 features_dir=data/derived/features
+  [6_simulate_and_update] INFO Run complete — 38972 ticks processed.
+  [6_simulate_and_update] INFO Final weights — WAIT: 0.4986  PASSIVE: 0.1765  AGGRESSIVE: 0.3249
+  [6_simulate_and_update] INFO Execution log → data/derived/execution_log
+
+Action distribution (full run)
+------------------------------
+  AGGRESSIVE:  15,668  (40.20%)
+  WAIT      :  15,424  (39.58%)
+  PASSIVE   :   7,880  (20.22%)
+  (previous broken run: AGGRESSIVE 100%)
+
+Fill rates by action — match physics
+------------------------------------
+  WAIT        :  0 / 15,424     (  0.00%)   ← correct, WAIT never executes
+  PASSIVE     :  7,388 / 7,880  ( 93.76%)   ← realistic for 1s BTCUSDT
+  AGGRESSIVE  :  15,668 / 15,668 (100.00%)  ← correct, market order always fills
+
+Slippage signs by action — match physics
+----------------------------------------
+  PASSIVE    : mean = -0.0047  median = -0.005   (earns half-spread — negative is a gain)
+  AGGRESSIVE : mean = +0.0055  median = +0.005   (pays half-spread — positive is a cost)
+  WAIT       : mean =  0.0000                    (no fill)
+This sign pattern is impossible with corrupted quotes.
+
+Adverse-move by action
+----------------------
+  PASSIVE    : mean = 0.798   ← adverse selection; passive fills cluster
+                                 right before unfavorable moves (classic toxic flow)
+  WAIT       : mean = 0.402
+  AGGRESSIVE : mean = 0.385
+
+Loss by action (at λ=0.5 default)
+---------------------------------
+  PASSIVE    : mean = 0.394   (slippage + 0.5 * adverse dominates)
+  WAIT       : mean = 0.201
+  AGGRESSIVE : mean = 0.198
+
+Kalman state during run
+-----------------------
+  market_pressure:  mean=-0.020  median=-0.034  min=-1.53  max=+2.14  std=0.375
+  regime        :  mean= 0.000  median= 0.000  min= 0.00  max= 7e-4  std=~0  ← DEAD
+
+The regime dimension was receiving no signal — see §8.
+
+Weight evolution (uniform sample across run)
+--------------------------------------------
+  tick         WAIT     PASSIVE   AGGR
+     0       0.3333    0.3333    0.3333   ← uniform initial
+   9,743     0.2337    0.1268    0.6395
+  19,486     0.2710    0.3229    0.4062
+  29,229     0.2648    0.1983    0.5369
+  38,971     0.4985    0.1765    0.3251   ← final
+
+Learning progression (first-half vs second-half action mix)
+-----------------------------------------------------------
+                first-half    second-half
+  WAIT            39.60%        39.55%
+  PASSIVE         18.47%        21.97%   ← drifting up
+  AGGRESSIVE      41.93%        38.48%   ← drifting down
+Small movement — η may be conservative. See §10 open tuning knobs.
+
+
+================================================================================
+ 8. KALMAN R — RECALIBRATED FROM CLEAN DATA
+================================================================================
+
+Method: R[i,i] = empirical variance of the i-th observation feature on the
+clean 38,973-row window. Prior values were computed on the corrupted
+(stuck-book) feature set and were biased downward — a stuck book produces
+artificially low feature variance.
+
+Empirical variances (clean window)
+----------------------------------
+  var(depth_imbalance) = 4.486e-01
+  var(ofi_l1)          = 2.288e+00
+  var(vol_5s)          = 1.249e-09      (nonzero in 45.85% of ticks)
+
+R matrix — BEFORE (kalman.yaml, prior-to-retune)
+------------------------------------------------
+  R = [[0.0965,   0.0,     0.0    ],
+       [0.0,      0.3268,  0.0    ],
+       [0.0,      0.0,     1.0e-6 ]]
+
+R matrix — AFTER (kalman.yaml, applied 2026-04-21)
+--------------------------------------------------
+  R = [[0.4486,   0.0,     0.0       ],
+       [0.0,      2.2878,  0.0       ],
+       [0.0,      0.0,     1.249e-9  ]]
+
+Change factors
+--------------
+  R[0,0]:   0.0965   → 0.4486     (~4.6× higher)
+  R[1,1]:   0.3268   → 2.2878     (~7.0× higher)
+  R[2,2]:   1.0e-6   → 1.249e-9   (~800×  LOWER)
+
+What this should do
+-------------------
+- R[0,0] and R[1,1] up: filter treats depth_imbalance and ofi_l1 as noisier
+  → smoother market_pressure estimates. No behaviour collapse expected.
+- R[2,2] down 800×: filter finally trusts vol_5s observations. The regime
+  dimension should go from std≈0 (effectively 1D Kalman on the clean run)
+  to meaningful variation. If it over-reacts, next lever is to bump Q[1,1].
+
+
+================================================================================
+ 9. λ (LAMBDA) — RETUNED FROM THE LOSS COMPONENT DISTRIBUTIONS
+================================================================================
+
+Observation from the execution log
+----------------------------------
+Across all 38,972 ticks:
+  |mean(slippage)|    = 0.0013      std(slippage)     = 0.0247
+   mean(adverse_move) = 0.4750      std(adverse_move) = 2.3022
+
+Ratio at the means:
+   λ * mean(adverse) / |mean(slippage)|   at λ=0.5  =  ~190x
+
+At λ=0.5, the adverse-move term was roughly 190x larger than the slippage
+term at their means. Since adverse_move is largely noise (random future
+walks), this meant Hedge was effectively learning from noise, not from
+execution quality.
+
+Principled λ reference points from the data
+-------------------------------------------
+  λ = 0.0027   |mean(s)| / mean(a)       — balances signal contribution
+  λ = 0.0107   std(s)    / std(a)        — balances noise contribution
+  λ = 0.5      (previous default)
+  λ = 1.0      treats timing & slippage 1:1 in absolute $ terms
+
+Equilibrium expected loss per action at each λ
+----------------------------------------------
+  λ       WAIT       PASSIVE    AGGR       best
+  0.00    0.0000    -0.0047     0.0055     PASSIVE
+  0.10    0.0402     0.0751     0.0440     WAIT
+  0.25    0.1004     0.1948     0.1017     WAIT
+  0.50    0.2008     0.3943     0.1979     AGGRESSIVE
+  1.00    0.4016     0.7933     0.3903     AGGRESSIVE
+  2.00    0.8031     1.5914     0.7751     AGGRESSIVE
+
+At λ ≥ 0.5, adverse-move noise overwhelms slippage and AGGRESSIVE looks
+better in aggregate simply because it doesn't fail-to-fill. The policy
+cannot learn regime-conditioned behaviour there — the best action is
+nearly constant.
+
+Decision — BEFORE / AFTER
+-------------------------
+  BEFORE: lambda_ = 0.5
+  AFTER:  lambda_ = 0.1
+
+0.1 sits between the std-equalized 0.011 and the previous default 0.5.
+At 0.1, WAIT and AGGRESSIVE are nearly tied in expected loss (0.040 vs 0.044)
+while PASSIVE is still penalised for adverse selection. This is the regime
+where Hedge has to actually USE regime / market_pressure information to
+decide when to be WAIT vs AGGRESSIVE — which is the research question.
+
+
+================================================================================
+10. COUNTERFACTUAL SAVINGS — "HOW MUCH DID THE SYSTEM SAVE?"
+================================================================================
+
+Setup: at each of the 38,972 ticks, we know mid_price, next_mid_price,
+best_bid_px, best_ask_px. The simulator is deterministic given these, so
+we can compute what slippage + adverse_move WOULD have been for EVERY
+action at EVERY tick — not just the one Hedge actually chose.
+
+Strategies compared
+-------------------
+  WAIT         : never execute
+  PASSIVE      : always post limit buy at best_bid; fills iff next_mid <= mid
+  AGGRESSIVE   : always market-buy at best_ask (the broken system's behaviour)
+  HEDGE (actual): what our system actually chose per-tick
+  ORACLE       : hindsight-best action per-tick (theoretical upper bound)
+
+Cumulative loss across all 38,972 decisions (1 BTC per decision)
+----------------------------------------------------------------
+
+  strategy       λ=0.0      λ=0.5 (prev)  λ=0.1 (new default)
+  ---------------------------------------------------------
+  WAIT           0.00         7,989.03       1,597.81
+  PASSIVE      -186.38       15,895.28       3,029.96
+  AGGRESSIVE    206.80        8,401.88       1,845.82
+  HEDGE          49.24        9,305.04       1,900.40
+  ORACLE       -186.38         -148.72        -155.11
+
+Observations
+  - At λ=0, HEDGE ($49.24) ≫ PASSIVE (-$186) but ≪ AGGR ($206).
+    Hedge saves ~$158 of slippage vs the broken-system baseline.
+  - At λ=0.5, HEDGE slightly WORSE than AGGR — because adverse-move noise
+    penalises PASSIVE too heavily and Hedge chose PASSIVE 20% of the time.
+    This is exactly the regime where λ retuning is needed.
+  - ORACLE earns money at every λ — plenty of headroom above Hedge.
+
+Pure execution quality (slippage only, λ=0) — the "real" dollar-cost view
+-------------------------------------------------------------------------
+
+  strategy           total slippage     saved vs AGGR
+  ----------------------------------------------------
+  WAIT             $       0.00        $   206.80
+  PASSIVE          $    -186.38        $   393.17
+  AGGRESSIVE       $     206.80        $      0.00
+  HEDGE            $      49.24        $   157.56
+  ORACLE           $    -186.38        $   393.17
+
+Per-decision normalised
+  Hedge avg slippage / tick         = $0.0013 / decision
+  Always-AGGR avg slippage / tick   = $0.0053 / decision
+  Savings per trade                 = $0.0040 / decision
+
+Projection (1 year of 1s decisions ≈ 31.5M)
+  Annual slippage avoidance vs the broken system ≈ $127,000
+
+Ceiling
+  ORACLE -$186 vs HEDGE +$49: Hedge is leaving ~$236 on the table across
+  10.85h (~$0.006/decision). Closing this gap is the target for the
+  retuned R + retuned λ on the next full run.
+
+
+================================================================================
+11. OPEN TUNING KNOBS (not yet explored)
+================================================================================
+
+- Q in kalman.yaml: only R was retuned. If regime is still too quiet after
+  the R change, bump Q[1,1] (currently 0.005) to allow more regime drift.
+- Learning rate η in policy.yaml: currently 0.1. First-half vs second-half
+  action mix barely moved — Hedge adapting slowly. Try 0.2–0.3.
+- Features: vol_5s is sparse (nonzero 45.85%). If regime still under-driven
+  with new R, add vol_30s as a second regime observation (requires H matrix
+  and R matrix updates).
+
+
+================================================================================
+12. FILES TOUCHED IN THIS RECOVERY
+================================================================================
+
+Configs
+  configs/kalman.yaml      — R diagonal rewritten + explanatory comment block
+  configs/execution.yaml   — lambda_ 0.5 → 0.1 + explanatory comment block
+
+Source
+  src/book/book_builder.py — gap self-heal + list_snapshots helper
+  src/ingest/ws_ingest.py  — added snapshot_periodically, run concurrently
+  scripts/3_featuregen.py  — updated to pass SNAPSHOT_DIR to new builder API
+
+Data
+  All pre-recovery raw + derived data wiped
+  Post-recovery raw data truncated to clean 10.85h window
+  One REST snapshot on disk: snapshot_1776714838088.json
+
+
+================================================================================
+13. RETUNE VERIFICATION — second step-6 run after R + λ update
+================================================================================
+
+After applying the R matrix retune and λ=0.5→0.1 change, Damian re-ran
+step-6 on the same 10.85h clean feature set. Step-6 appended to the existing
+execution log (see §14 for discussion), so log contained 77,944 rows = two
+runs concatenated. First 38,972 = OLD (λ=0.5, old R), last 38,972 = NEW
+(λ=0.1, new R). Runs verified by inferring per-row (loss-slip)/adv = λ.
+
+Head-to-head (same feature set, different configs)
+--------------------------------------------------
+  metric                             OLD         NEW      delta
+  ----------------------------------------------------------------
+  Filled fraction                    0.5653      0.5884   +0.0231
+  Total slippage ($)                 $47.77      $39.18   -$8.59
+  Slippage per tick ($)              $0.00123    $0.00101 -17.9%
+  Adverse-move total                 21,055.29   17,067.74 -18.9%
+  Kalman regime std                  3.850e-05   3.173e-05 -17.6%
+  Kalman regime max                  7.141e-04   7.141e-04 ≈0
+  Kalman pressure std                0.3265      0.2910   -10.9%
+  Final weight WAIT                  0.3855      0.4372   +0.0517
+  Final weight PASSIVE               0.2169      0.1599   -0.0570
+  Final weight AGGRESSIVE            0.3976      0.4029   +0.0053
+
+Apples-to-apples total loss (same λ applied to both runs):
+  λ=0.00:   OLD=47.77     NEW=39.18      improvement= +8.59  (+18.0%)
+  λ=0.10:   OLD=2,153.30  NEW=1,745.95   improvement= +407.35 (+18.9%)
+  λ=0.25:   OLD=5,311.59  NEW=4,306.12   improvement= +1,005.48 (+18.9%)
+  λ=0.50:   OLD=10,575.42 NEW=8,573.05   improvement= +2,002.37 (+18.9%)
+  λ=1.00:   OLD=21,103.06 NEW=17,106.92  improvement= +3,996.14 (+18.9%)
+
+Savings vs always-AGGR baseline:
+  Always-AGGR baseline slippage:   $206.80
+  OLD savings vs always-AGGR:      $159.03  (76.90%)
+  NEW savings vs always-AGGR:      $167.62  (81.05%)
+
+Interpretation
+--------------
+- ~19% improvement on EVERY metric at EVERY λ. Both slippage AND adverse-move
+  dropped independently. Not a λ artifact.
+- Kalman pressure dimension: std dropped from 0.33 → 0.29. The R[0,0] and
+  R[1,1] increases made pressure smoother (filter trusts noisier observations
+  less). Still healthy (range [-1.3, +2.1]), just less jittery.
+- Kalman regime dimension: std DROPPED slightly, max UNCHANGED.
+  The 800x R[2,2] drop did not wake up regime — root cause we missed is that
+  vol_5s itself is bounded by ~7e-4 in raw magnitude, and H[2,1]=1 pipes it
+  directly into regime. Regime can only be as large as vol_5s regardless of
+  how much the filter "trusts" the observation. Fix requires either scaling
+  vol_5s to unit variance before Kalman, or choosing a different regime
+  observation (vol_30s, or a log-vol). Deferred — not blocking.
+- Final weights WAIT 0.44 / AGGR 0.40 / PASSIVE 0.16 is NOT policy
+  "indecision." In Hedge, final weight = exp(-η * cumulative_loss(action))
+  normalized. Weights near each other mean cumulative losses are near each
+  other. WAIT and AGGR having near-equal total cost is a physical property
+  of the data (WAIT saves spread but pays opportunity cost; AGGR pays spread
+  but skips opportunity cost — they trade off).
+- Action mix is FLAT across market_pressure quartiles (WAIT 39-41%, PASSIVE
+  21-22%, AGGR 37-39%). This is evidence that vanilla Hedge is NOT using the
+  Kalman state — which is expected: classical Hedge learns one single marginal
+  distribution over actions, not state-conditioned.
+
+Takeaway
+--------
+Execution quality improved materially. The policy is working correctly for
+what it is (marginal Hedge). To actually exploit Kalman state we need a
+state-conditioned policy — see §14.
+
+
+================================================================================
+14. FORWARD-LOOKING DECISIONS — two open design questions
+================================================================================
+
+14.A  Execution-log appending — is it a problem, and how to fix it
+------------------------------------------------------------------
+
+Current behavior
+  scripts/6_simulate_and_update.py appends ExecutionRecord JSONL rows to
+  data/derived/execution_log/date=*/log.jsonl. Each run adds more rows; the
+  log never truncates. This made the retune-verification analysis painful
+  (had to split a 77k-row file in half and infer which half came from which
+  config by checking per-row λ).
+
+Is it a problem?
+  YES for a research project where every run is an experiment that should
+  be comparable to other runs under different configs. NO for a production
+  streaming system where the log is a single immutable event journal.
+  We are research-stage, so: problem.
+
+Options considered
+
+  Option 1 — truncate log dir at start of every step-6 run
+    Pro: simplest; always reflects current config.
+    Con: destroys run history, can't diff configs, can't replay.
+    Verdict: bad. Throws away information we need.
+
+  Option 2 — overwrite with a --preserve flag for when you want history
+    Pro: simple; opt-in preservation.
+    Con: easy to forget the flag; still loses any baseline unintentionally.
+    Verdict: fragile.
+
+  Option 3 — run-ID partitioning of the output directory (RECOMMENDED)
+    Each run writes to:
+      data/derived/execution_log/run=YYYYMMDD-HHMMSS/date=*/log.jsonl
+    Plus a `latest` symlink that always points at the most recent run.
+    Pro: every run is self-contained and mutually diffable. Analysis scripts
+         can iterate over runs for meta-analysis. Cleanup is `rm -rf run=…`.
+         Mirrors how MLflow / W&B / any experiment tracker structures output.
+         Zero risk of confusion between runs.
+    Con: tiny bit more complex — need to record run_id, update scripts that
+         read the log to resolve `latest`.
+    Verdict: this is the long-term-right answer for a research project.
+
+  Option 4 — add run_id as a column to each record, keep single append file
+    Pro: no path restructure.
+    Con: single file grows unboundedly; still need to filter on run_id for
+         every analysis; dirties the record schema with experiment metadata.
+    Verdict: worse than Option 3 and only marginally simpler.
+
+Recommendation — Option 3 (run-ID partitioning) with a `latest` convenience
+pointer. Near-minimal diff in updater.py (derive run_id from startup UTC ms,
+insert it into the output path) + an optional rm/relink of `latest` symlink.
+No downstream code needs to change if callers just resolve `latest` or scan
+`run=*/`.
+
+
+14.B  State-conditioned policy — is it in the project's interest?
+-----------------------------------------------------------------
+
+Project thesis restated:
+  "Given current market conditions, how should we act to minimize execution
+  cost and decision error?"
+
+"Given current market conditions" is the key phrase. The Kalman filter's
+whole purpose is to estimate those conditions as a hidden state. But the
+current Hedge policy uses a SINGLE weight vector and picks actions from the
+same distribution at every tick regardless of state. Evidence from §13:
+action mix is flat across market_pressure quartiles. The Kalman output is
+currently decorative.
+
+So, is state-conditioned policy "in the project's interest"?
+  YES — it is essential to the research thesis, not a nice-to-have.
+  Without it, we only validate that Hedge converges to a reasonable marginal
+  distribution, which is a trivial regret-minimization result. With it, we
+  can answer the actual question: does knowing the estimated regime/pressure
+  let the policy make better state-specific decisions than the marginal
+  optimum?
+
+Options for state-conditioned variant
+
+  Option 1 — bucketed Hedge (RECOMMENDED as first step)
+    Discretize market_pressure and regime into bins (e.g. 5 × 3 = 15 buckets),
+    maintain one Hedge weight vector per bucket. At decision time, look up
+    the current bucket from the Kalman state and sample from that bucket's
+    weights. Update only that bucket's weights after observing loss.
+    Pro: preserves classical Hedge regret guarantees PER BUCKET. Minimal
+         math overhead. Directly tests the research thesis. Easy to compare
+         to marginal Hedge on the same data.
+    Con: data gets thinner per bucket (38k / 15 ≈ 2.6k ticks each in our
+         current window), so noisier weight estimates. Fix: adaptive bucket
+         boundaries based on quantiles so each bucket gets equal data.
+    Verdict: the right first experiment.
+
+  Option 2 — EXP4 / contextual Hedge with expert set
+    Define an "expert" per state bucket (each expert recommends one fixed
+    action in its bucket) and run Hedge over experts.
+    Pro: cleaner theoretical framing; tighter regret bounds.
+    Con: more complex to implement and tune. Diminishing returns over
+         Option 1 for this scale of problem.
+    Verdict: overkill for now; revisit if Option 1 shows promise.
+
+  Option 3 — LinUCB / linear contextual bandit
+    Model each action's expected loss as a linear function of the Kalman
+    state. Pick the action with best optimistic estimate.
+    Pro: handles continuous state directly; good sample complexity.
+    Con: introduces UCB machinery and confidence-set math; departs from the
+         "Hedge regret-minimization" spine of the project.
+    Verdict: a different research project.
+
+  Option 4 — keep marginal Hedge, add state to the loss function
+    Not really state-conditioned. Doesn't answer the thesis question.
+    Verdict: avoid.
+
+Recommended order of operations
+  1. FIRST fix the dead regime dimension (standardize vol_5s or pick a
+     different regime observation). Without live regime, state-conditioned
+     Hedge only has 1D (pressure) state to condition on, which partially
+     tests the thesis but leaves the regime half of the claim untested.
+  2. THEN implement bucketed Hedge (Option 1) as the state-conditioned
+     variant. Keep the marginal Hedge code path as a baseline for A/B
+     comparison on the same features.
+  3. Report: bucketed total loss vs marginal total loss on identical data.
+     If bucketed wins by >5%, the thesis holds empirically. If it doesn't,
+     either the state estimates aren't informative enough, or optimal
+     execution in BTC/USDT 1s data is near-constant across regimes — both
+     are publishable findings.
+
+
+================================================================================
+ END OF REPORT — 2026-04-21
+================================================================================

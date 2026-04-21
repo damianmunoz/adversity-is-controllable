@@ -1,0 +1,3 @@
+# Order book reconstruction settings
+top_n_levels: 20              # how many price levels to keep in BookSnapshot
+snapshot_every_n_events: 10   # emit a snapshot every N depth updates (~1s at 100ms stream)

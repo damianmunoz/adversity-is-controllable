@@ -1,0 +1,29 @@
+# configs/execution.yaml
+
+# Adverse move penalty weight (λ) in the loss function:
+#   L = slippage + λ * adverse_move
+#
+# Retuned 2026-04-21 from the first post-recovery clean window (38,972 ticks).
+# Empirical distributions showed adverse_move dwarfed slippage:
+#   mean|slippage|   = 0.0013   std(slippage)    = 0.0247
+#   mean(adverse)    = 0.4750   std(adverse)     = 2.3022
+# At λ=0.5 the adverse term was ~190x the slippage term at their means, so
+# adverse-move noise dominated the loss signal — Hedge was effectively
+# learning from random future price walks, not execution quality.
+#
+# Principled reference points from the data:
+#   λ = 0.0107 — std-equalized (balances noise contribution of each term)
+#   λ = 0.003  — mean-equalized (balances signal contribution)
+#   λ = 0.5    — previous default, over-weighted adverse_move
+#   λ = 1.0    — dollar-equal (treats timing and slippage 1:1 in absolute $)
+#
+# We split the difference at λ=0.1: adverse_move still matters meaningfully
+# (policy can still prefer calmer regimes) but the execution-quality signal
+# is no longer drowned out. At λ=0.1 the equilibrium per-action cost is
+# roughly WAIT ≈ AGGRESSIVE ≈ small, PASSIVE heavier — which is the regime
+# the Hedge policy needs in order to learn genuine regime-conditioned action
+# preferences rather than a single dominant choice.
+lambda_: 0.1
+
+# Output directory for execution log JSONL files (Hive partitioned by date)
+output_dir: data/derived/execution_log

@@ -1,0 +1,13 @@
+# configs/policy.yaml
+
+# Learning rate η for the multiplicative weights update.
+# Controls how fast the policy adapts to observed losses.
+# Too high (>0.5): overreacts to noisy individual ticks, weights collapse fast.
+# Too low (<0.01): adapts so slowly it behaves like random for a long time.
+# 0.1 is a reasonable starting point for ~1s ticks with losses in [0, 1].
+# Tune after running the full loop in script 6 — look at weight convergence speed.
+learning_rate: 0.1
+
+# Starting weight for each action before any losses are observed.
+# All actions start equal (uniform distribution) — no prior on which is best.
+initial_weight: 1.0
