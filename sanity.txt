@@ -670,5 +670,117 @@ Recommended order of operations
 
 
 ================================================================================
+15. STATE-CONDITIONED HEDGE — 10-SEED A/B (2026-04-21)
+================================================================================
+
+Setup
+-----
+BucketedHedgePolicy was implemented alongside classical HedgePolicy. Selected
+via configs/policy.yaml:mode ("marginal" | "bucketed"). Bucketed variant
+maintains one Hedge weight vector per market_pressure bucket, defined by
+pressure_edges = [-0.5, -0.2, 0.0, 0.2, 0.5]  (6 buckets).
+
+A/B protocol
+  - Same 38,972-row clean feature set (10.85h BTCUSDT)
+  - Same KalmanConfig (new R diagonal), same execution λ=0.1
+  - 10 RNG seeds (0–9) × 2 modes = 20 replays
+  - Metrics collected in memory only (no disk spam)
+  - Paired comparison: same seed used for both modes
+
+Per-seed results
+----------------
+  seed  mode        loss        slippage  adv_move     fill%  action mix (W/P/A %)
+  -------------------------------------------------------------------------------
+   0    marginal   1970.85      30.06   19407.90    54.40    44.1 / 21.6 / 34.2
+   0    bucketed   1438.99      49.36   13896.26    50.98    47.9 / 14.7 / 37.4
+   1    marginal   1999.87      26.76   19731.01    55.16    43.4 / 22.3 / 34.3
+   1    bucketed   1415.54      46.65   13688.90    53.13    45.8 / 15.9 / 38.3
+   2    marginal   1962.24      33.37   19288.70    56.87    41.6 / 22.9 / 35.5
+   2    bucketed   1410.02      51.64   13583.76    53.96    44.9 / 15.7 / 39.4
+   3    marginal   1969.10      33.52   19355.79    55.03    43.4 / 22.0 / 34.6
+   3    bucketed   1386.16      43.58   13425.76    52.92    45.9 / 16.5 / 37.6
+   4    marginal   1957.32      28.63   19286.86    56.57    41.9 / 23.2 / 35.0
+   4    bucketed   1438.15      47.64   13905.15    54.86    43.9 / 17.6 / 38.5
+   5    marginal   1989.80      30.71   19590.83    57.56    40.9 / 22.8 / 36.3
+   5    bucketed   1403.10      49.09   13540.12    55.41    43.4 / 17.0 / 39.6
+   6    marginal   2028.42      33.67   19947.51    57.23    41.4 / 21.5 / 37.2
+   6    bucketed   1441.05      46.70   13943.54    53.13    45.7 / 16.5 / 37.9
+   7    marginal   1955.70      38.15   19175.42    58.43    40.1 / 21.8 / 38.1
+   7    bucketed   1391.72      54.01   13377.07    54.14    44.7 / 15.8 / 39.5
+   8    marginal   2007.93      37.22   19707.14    57.43    41.2 / 21.5 / 37.4
+   8    bucketed   1397.58      52.95   13446.31    53.99    45.0 / 15.9 / 39.2
+   9    marginal   2012.29      26.74   19855.45    57.29    41.0 / 23.9 / 35.0
+   9    bucketed   1430.71      45.75   13849.59    52.41    46.4 / 16.2 / 37.5
+
+Bucketed wins on total loss in 10 out of 10 seeds. Not a single failure.
+
+Aggregate (mean ± std across 10 seeds)
+---------------------------------------
+  metric                 MARGINAL              BUCKETED
+  ----------------------------------------------------------------
+  Total loss (λ=0.1)     1,985.35 ±   25.81    1,415.30 ±   20.76
+  Slippage ($)              31.89 ±    4.00       48.74 ±    3.33
+  Adverse move          19,534.66 ±  267.46   13,665.65 ±  219.48
+  Fill rate                  56.60% ± 1.31%       53.49% ± 1.27%
+
+Paired difference (bucketed_loss − marginal_loss, same seed)
+  mean diff = -570.05
+  std       = 28.10
+  t-stat    = -64.15  (n=10)
+  interpretation: bucketed beats marginal by 570 loss units per run, with
+  a standard deviation of only 28 across seeds. The signal is ~20x larger
+  than the noise — overwhelming evidence that the improvement is real, not
+  a lucky single-run artifact. For reference, typical two-sample t-stats
+  reported as "significant" are |t| > 2-3; this is |t| > 64.
+
+Apples-to-apples total loss at different λ values (mean across 10 seeds)
+-------------------------------------------------------------------------
+  λ        MARGINAL        BUCKETED     improvement    rel
+  -------------------------------------------------------------
+  0.00         31.89           48.74        -16.85   -52.9%    ← bucketed LOSES here
+  0.10      1,985.35       1,415.30       +570.05   +28.7%
+  0.25      4,915.55       3,465.15     +1,450.40   +29.5%
+  0.50      9,799.22       6,881.56     +2,917.65   +29.8%
+  1.00     19,566.55      13,714.39     +5,852.16   +29.9%
+
+Action mix (mean% across 10 seeds)
+----------------------------------
+  action          MARGINAL             BUCKETED
+  WAIT         41.90 ± 1.30%        45.36 ± 1.28%
+  PASSIVE      22.34 ± 0.83%        16.16 ± 0.79%
+  AGGRESSIVE   35.76 ± 1.39%        38.48 ± 0.87%
+
+Interpretation
+--------------
+Bucketed is a clearly superior policy on the combined cost metric at every
+λ ≥ 0.1. It wins by trading off two cost components:
+  - takes MORE slippage  (+$16.85) by skipping some passive fills
+  - avoids MUCH MORE adverse-move  (-5,869 total ≈ -$5,869 of timing risk)
+
+At λ=0 (slippage-only view), bucketed loses by 53% — but that metric is
+blind to the dominant real-dollar cost in this problem (adverse price moves
+after execution). Slippage in BTC/USDT 1s ticks is capped at ±$0.005
+(half-spread); adverse moves can be dollars per tick. Any loss function that
+cares about the dollar P&L of execution, not just the spread paid, favors
+bucketed.
+
+The research thesis holds empirically:
+  "Given current market conditions, how should we act?"  →  Yes. Using the
+  estimated market_pressure to condition action selection cuts total cost by
+  ~29% vs a policy that averages over all states, with a paired t-stat of
+  -64 across 10 seeds. The Kalman filter earned its keep.
+
+Remaining gaps to a clean research result
+  - Regime dimension of the Kalman state is still dead (max ≈ 7e-4 raw
+    magnitude). Bucketing is currently pressure-only. Fixing regime and
+    adding regime_edges to PolicyConfig is the next A/B.
+  - Data is one 10.85h window from 2026-04-20 to 2026-04-21. Multi-day
+    evaluation would test whether pressure-buckets generalize or overfit
+    to this window's price regime.
+  - Hedge RNG seed had to be passed through for reproducibility; no other
+    component has an RNG, so runs are deterministic given the seed.
+
+
+================================================================================
  END OF REPORT — 2026-04-21
 ================================================================================
