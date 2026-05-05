@@ -23,7 +23,7 @@ All parameters come from configs/kalman.yaml.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 import numpy as np
@@ -43,6 +43,15 @@ class KalmanConfig:
 
     All matrix fields arrive from YAML as Python list-of-lists.
     KalmanFilter.__init__ converts them to numpy arrays.
+
+    obs_center / obs_scale are an OPTIONAL per-observation standardization.
+    Before the update step, each component of the observation vector is
+    transformed as:  z_i = (z_i - obs_center[i]) * obs_scale[i]
+    Defaults (zeros / ones) make this a no-op. They exist so a feature that
+    lives on a numerically tiny scale (e.g. vol_30s, max ≈ 3e-4) can be
+    standardized to unit variance before hitting the filter — otherwise the
+    filter can never move the corresponding hidden-state dimension by any
+    meaningful amount regardless of R.
     """
     state_dim: int
     obs_dim: int
@@ -53,6 +62,8 @@ class KalmanConfig:
     R: list
     x0: list
     P0: list
+    obs_center: Optional[List[float]] = None
+    obs_scale:  Optional[List[float]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +119,16 @@ class KalmanFilter:
         self.H = np.array(config.H, dtype=float)   # (obs_dim,   state_dim)
         self.Q = np.array(config.Q, dtype=float)   # (state_dim, state_dim)
         self.R = np.array(config.R, dtype=float)   # (obs_dim,   obs_dim)
+
+        # Per-observation standardization constants. Defaults are identity.
+        center = config.obs_center if config.obs_center is not None else [0.0] * config.obs_dim
+        scale  = config.obs_scale  if config.obs_scale  is not None else [1.0] * config.obs_dim
+        if len(center) != config.obs_dim or len(scale) != config.obs_dim:
+            raise ValueError(
+                f"obs_center/obs_scale length must equal obs_dim={config.obs_dim}"
+            )
+        self._obs_center = np.array(center, dtype=float)
+        self._obs_scale  = np.array(scale,  dtype=float)
 
         # Internal state: posterior mean and covariance
         self._x: np.ndarray = np.array(config.x0, dtype=float)   # (state_dim,)
@@ -167,6 +188,10 @@ class KalmanFilter:
         if np.any(np.isnan(z)):
             log.debug("Skipping ts=%d — NaN in observation vector.", ts_ms)
             return None
+
+        # Standardize observation: z = (z - center) * scale
+        # No-op when center=0 and scale=1 (the YAML defaults).
+        z = (z - self._obs_center) * self._obs_scale
 
         x_pred, P_pred = self._predict()
         self._update(z, x_pred, P_pred)

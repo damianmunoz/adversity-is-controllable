@@ -1,0 +1,677 @@
+================================================================================
+ RESULTS REPORT — adversity-is-controllable
+ BTC/USDT adaptive execution with Hedge + Kalman, all results to date
+ Compiled: 2026-05-02
+================================================================================
+
+This document is a one-stop write-up of every A/B result the project has
+produced so far, what each plot is showing, what we believe based on it,
+and the single credible direction we should take for the final thesis
+chapter. It pulls numbers directly from sanity.txt and from the JSON
+files in data/derived/. Plots are referenced by relative path; open them
+side-by-side in any image viewer while reading the matching block here.
+
+If you only read one section, read EXECUTIVE SUMMARY and FINAL CREDIBLE
+IDEA at the end.
+
+
+================================================================================
+ EXECUTIVE SUMMARY (read this first)
+================================================================================
+
+THE QUESTION (project thesis, unchanged)
+  Given current market conditions, how should an agent that MUST buy
+  1 BTC every 100ms minimize execution cost (slippage + λ * adverse-move)?
+
+THE WINNER, ROBUSTLY
+  1D pressure-bucketed Hedge — six Hedge policies, one per market_pressure
+  bucket. Wins across every comparison we have done. No competitor has
+  beaten it on more than one session.
+
+THE FOUR THINGS WE TESTED
+  Each "richer" policy uses 1D pressure as its primary axis and adds a
+  second axis on top.
+                                     paired wins vs 1D
+  competitor                         (out of 40)          verdict
+  ---------------------------------------------------------------------
+  marginal Hedge (no state at all)        0/10 (S1 only)  KILLED — 1D +29%
+  2D regime (Kalman regime as 2nd axis)   0/20 (S2,S3)    KILLED — 1D +6%
+  vol_delta (60s rising vol)              0/40            DEAD signal
+  spread_delta (60s widening spread)      0/40            DEAD signal
+  ofi_window (60s net OFI)               16/40            INCONCLUSIVE
+                                                          (1 win, 1 tie,
+                                                           2 losses)
+
+THE ONE-SENTENCE BOTTOM LINE
+  At BTCUSDT 100ms ticks, knowing the market pressure is enough to win;
+  every attempt to add a second axis splits the data thinner without
+  adding decision-relevant signal, and the policy ends up taking more
+  toxic passive fills.
+
+THE PIVOT FOR THE FINAL THESIS CHAPTER
+  Stop adding state axes. The bucket family has hit its ceiling. The
+  next gain has to come from a richer ACTION SPACE (variable order
+  size), not from a richer STATE SPACE. Recommended chapter: "size-
+  conditioned Hedge" — one Hedge over a 9-action set
+  {WAIT, PASSIVE×{0.5,1,2}BTC, AGGRESSIVE×{0.5,1,2}BTC} per pressure
+  bucket. Detail at the end.
+
+
+================================================================================
+ 1. THE EVIDENCE TRAIL — five sessions, three policy generations
+================================================================================
+
+Sessions on disk that we ran experiments on:
+
+  id     when                         hours   ticks    notes
+  ----------------------------------------------------------------------
+  S1     2026-04-20 19:54 → 04-21     10.83   38,973   first clean run
+  S2     2026-04-28 03:12 → 14:02     10.83   38,977   first true overnight
+  S3     2026-04-30 01:45 → 19:25     17.66   63,590   first long session
+  S7     2026-04-30 23:00 → 05-01     21.08   75,885   biggest session ever
+
+S4/5/6 are tiny gap fragments produced by the §5.1 self-heal patch and
+are excluded from every analysis (sanity §23).
+
+Three policy generations were tested on these:
+
+  Gen 1   marginal Hedge        — single weight vector over 3 actions.
+                                  ignores Kalman state. baseline.
+  Gen 2   1D bucketed Hedge     — 6 weight vectors, one per pressure
+                                  bucket. uses Kalman pressure only.
+  Gen 3a  2D regime Hedge       — 18 weight vectors (6 pressure × 3
+                                  Kalman regime). uses BOTH Kalman
+                                  state dimensions.
+  Gen 3b  adverse-2D Hedge      — 18 weight vectors. second axis is a
+                                  60s rolling-window signal designed
+                                  to predict adverse-risk specifically.
+                                  Three signals tried:
+                                    A vol_delta    (vol_30s rising)
+                                    B ofi_window   (60s net OFI)
+                                    C spread_delta (60s widening)
+
+
+================================================================================
+ 2. THE FIVE PLOTS — what each one shows, what to take away
+================================================================================
+
+All plots live in data/derived/figures/section25/ and are regenerable
+from data/derived/ab_adverse_3sessions_10seed.json via:
+
+    PYTHONPATH=. python scripts/_plots_section25.py
+
+The data behind every plot is 4 sessions × 10 seeds × 4 modes = 160
+paired runs, all at the same η=0.1, λ=0.1, same Kalman config, same
+pressure bucketing, paired by seed.
+
+────────────────────────────────────────────────────────────────────────
+ FIG 1 — fig01_total_loss_per_session.png
+ Mean total_loss per (session × mode), error bars = stdev across 10 seeds.
+────────────────────────────────────────────────────────────────────────
+
+  PATH: data/derived/figures/section25/fig01_total_loss_per_session.png
+
+What you see:
+  Four groups of bars (S1, S2, S3, S7). In each group: 1D (gray),
+  A vol_delta (blue), B ofi_window (green), C spread_delta (red).
+  Numbers (mean ± std):
+
+  session     1D            A vol_delta    B ofi_window   C spread_delta
+  S1 (38k)    1,415 ± 21    1,549 ± 25     1,431 ± 22     1,483 ± 26
+  S2 (38k)    1,562 ± 30    1,677 ± 35     1,581 ± 32     1,613 ± 35
+  S3 (63k)    2,500 ± 32    2,669 ± 35     2,490 ± 34     2,591 ± 35
+  S7 (75k)    2,869 ± 50    3,034 ± 51     2,866 ± 34     2,964 ± 46
+
+What it tells us:
+  - The 1D bar is the lowest in S1 and S2.
+  - In S3 and S7, the 1D bar and the B (green) bar are visually tied,
+    with B fractionally lower in S3 and fractionally higher in S7.
+  - A (blue) and C (red) are ALWAYS taller than 1D, in every session.
+  - Total loss scales roughly linearly with session length — confirms
+    the per-tick effect is stable, the bigger numbers come from more
+    ticks not from a worse policy.
+
+What to read into it:
+  vol_delta and spread_delta are strictly worse than 1D on combined
+  cost. Their bars never cross under 1D. ofi_window touches 1D on the
+  long sessions but does not separate from it.
+
+────────────────────────────────────────────────────────────────────────
+ FIG 2 — fig02_paired_diff_vs_1d.png
+ Paired diff (mode_loss − 1D_loss), labeled with |t|. λ=0.1.
+────────────────────────────────────────────────────────────────────────
+
+  PATH: data/derived/figures/section25/fig02_paired_diff_vs_1d.png
+
+What you see:
+  For each session, three bars: paired diff for A, B, C vs 1D. Bars
+  ABOVE the y=0 line mean the competitor LOSES (positive diff = higher
+  loss). Bars BELOW y=0 mean the competitor WINS. Numbers:
+
+  session   A vol_delta (|t|)     B ofi_window (|t|)    C spread_delta (|t|)
+  S1        +133.51 (28.89)       +15.31 ( 2.97)        +68.07 (12.65)
+  S2        +115.50 (34.73)       +19.97 ( 5.45)        +51.93 (12.20)
+  S3        +168.87 (34.72)       -9.79  ( 2.37) WIN    +90.81 (28.48)
+  S7        +165.65 (25.05)       -2.30  ( 0.23) TIE    +95.05 (24.42)
+
+What it tells us:
+  - Blue (vol_delta) and red (spread_delta) bars are tall and positive
+    in every session. |t|>>2 every time. They lose, no question.
+  - Green (ofi_window) is the only bar that ever crosses below zero.
+    It does so on S3 (paired diff -9.79, |t|=2.37 — borderline real)
+    and barely so on S7 (-2.30, |t|=0.23 — pure noise).
+  - On the small sessions S1, S2, ofi_window is positive (loses by a
+    little) at |t| 3-5 — small but real losses.
+  - Comparing S3 and S7: more data did NOT make B's win bigger. It
+    SHRANK from -9.79 to -2.30 and the t-stat collapsed from 2.37 to
+    0.23. If "ofi_window needs more data per cell" were the right
+    explanation, more ticks should have helped, not hurt.
+
+What to read into it:
+  This is the figure that killed the "ofi_window is the next default"
+  story. The S3 win was a single-session result at the bare edge of
+  significance. Adding 19% more ticks (S7) erased it. Hypothesis A
+  (sample size) is dead. Hypothesis C (luck) is now the leading
+  explanation for the S3 win. Hypothesis B (specific market regime)
+  could still be alive but unverified.
+
+────────────────────────────────────────────────────────────────────────
+ FIG 3 — fig03_per_seed_scatter_ofi_window_vs_1d.png
+ Per-seed paired comparison: ofi_window vs 1D. 4 panels. Dot below y=x = win.
+────────────────────────────────────────────────────────────────────────
+
+  PATH: data/derived/figures/section25/fig03_per_seed_scatter_ofi_window_vs_1d.png
+
+What you see (4 panels, one per session):
+  S1: 2/10 dots below y=x  → ofi_window wins on 2 seeds, loses on 8.
+  S2: 1/10 dots below y=x  → 1 win, 9 losses.
+  S3: 8/10 dots below y=x  → 8 wins, 2 losses. THE ONE WIN SESSION.
+  S7: 5/10 dots below y=x  → coin flip. 5 wins, 5 losses.
+
+What it tells us:
+  Total across 4 sessions: 16 ofi_window wins out of 40 paired seeds.
+  That is below 50/50. Even the "win" panel (S3) is not 10/10 — it's
+  8/10. A real winning policy with the kind of effect size seen in
+  §15 (1D vs marginal) shows up as 10/10 every session, like it did
+  there.
+
+What to read into it:
+  The ofi_window signal is NOT consistently dominating 1D at the seed
+  level. Damian's two-session-rule (memory: feedback_two_session_rule.md)
+  applies cleanly here: ofi_window does not have the ≥2 sessions of
+  |t|≥2.0 with the same sign of effect that the rule requires before
+  promoting it. It is a candidate, not a winner.
+
+────────────────────────────────────────────────────────────────────────
+ FIG 4 — fig04_action_mix_per_session.png
+ Mean action-mix percentages per (session × mode).
+────────────────────────────────────────────────────────────────────────
+
+  PATH: data/derived/figures/section25/fig04_action_mix_per_session.png
+
+What you see:
+  Three bar groups per session (WAIT / PASSIVE / AGGRESSIVE), four
+  bars per group (one per mode). Numbers (averaged across 10 seeds):
+
+  Session 1 (S1):
+    mode             WAIT %    PASSIVE %    AGGRESSIVE %
+    1D               45.36     16.16        38.48
+    A vol_delta      43.54     18.69        37.78
+    B ofi_window     44.75     17.58        37.68
+    C spread_delta   44.41     17.46        38.12
+
+  Session 7 (S7):
+    mode             WAIT %    PASSIVE %    AGGRESSIVE %
+    1D               44.82     17.13        38.05
+    A vol_delta      43.43     18.97        37.60
+    B ofi_window     43.27     18.40        38.33
+    C spread_delta   43.93     17.84        38.23
+
+  All sessions show the SAME pattern: every richer policy
+  (A, B, C) takes MORE PASSIVE actions than 1D (+1.4 to +2.5pp) and
+  fewer WAITs and AGGRESSIVEs.
+
+What it tells us:
+  Adding any second axis pulls the policy in the same direction:
+  more limit-bid posting, less "skip this tick" and less "cross
+  the spread now." The DIRECTION of the change is identical
+  regardless of what the second axis actually is.
+
+What to read into it:
+  This is the mechanistic root of every loss in fig 2. All three
+  signals (vol_delta, ofi_window, spread_delta) act like fill-quality
+  signals — they tell the policy "there is a chance to fill cheaply
+  here" — and the policy responds by posting more passive limit
+  orders. PASSIVE earns the spread when it fills BUT it preferentially
+  fills exactly when the price is about to move against you (toxic
+  flow, sanity §7). At λ=0.1 the toxicity cost outweighs the spread
+  saving.
+
+  This is what we call THE TOXICITY BARRIER and it is the single most
+  important finding in the whole project.
+
+────────────────────────────────────────────────────────────────────────
+ FIG 5 — fig05_slippage_vs_adverse.png
+ Pareto plot: total_slippage on x, total_adverse_move on y. Lower-left = better.
+────────────────────────────────────────────────────────────────────────
+
+  PATH: data/derived/figures/section25/fig05_slippage_vs_adverse.png
+
+What you see:
+  Each (session × mode) is a single dot. Sessions distinguished by
+  marker shape, modes by color. The plot has three rough clusters:
+
+  Lower-left  (10.8h sessions S1, S2):  $35-50 slip, 13-16k adv
+  Middle      (17.7h session S3):       $80-90 slip, 24-26k adv
+  Upper-right (21.1h session S7):       $97-105 slip, 27-29k adv
+
+  WITHIN each cluster, the four modes fall in a consistent pattern:
+    1D (gray):              furthest right, lowest down  (most slip,
+                                                          least adv)
+    A vol_delta (blue):     furthest left, highest up    (least slip,
+                                                          most adv)
+    C spread_delta (red):   middle-left
+    B ofi_window (green):   between 1D and A
+
+  Slope of the cloud is positive — every policy that saves slippage
+  takes on more adverse-move risk.
+
+What it tells us:
+  This is the cleanest visualization of THE TOXICITY BARRIER:
+    Δ slippage ≈ Δ adverse / 250
+  Each $1 of slippage savings shows up as roughly +$250 of adverse
+  units of regret. At λ=0.1 the breakeven is Δslip = -0.1*Δadv, i.e.
+  $1 of slippage saved is worth ~$10 of adverse forgiven. We are
+  trading $1 of slippage savings for ~$25 of equivalent adverse risk
+  (250 units × λ=0.1). Always a losing trade.
+
+  The ONE outlier is B ofi_window on S3: it is the only mode that
+  saves on BOTH axes (down-left of 1D-S3). On all other (session,
+  mode) pairs, the policies are stuck on the same upward-sloping
+  Pareto frontier.
+
+What to read into it:
+  All three of our "richer" policies move us up-and-left along the
+  same frontier. None of them creates a NEW dominating point. To
+  beat 1D in a way that survives across sessions, you need a
+  DIFFERENT FRONTIER, not a different point on the same one.
+
+  That is the whole reason the next thesis chapter has to change the
+  ACTION SPACE — the current action space cannot escape the
+  spread-vs-toxicity coupling.
+
+
+================================================================================
+ 3. CROSS-SESSION EVIDENCE TABLE (the master table)
+================================================================================
+
+Compiled from sanity.txt §15, §21, §23, §24, §25 and verified against
+the three JSONs in data/derived/.
+
+  test                        sessions   ticks/      seeds   |t|     wins
+                                         session                     /pairs
+  -------------------------------------------------------------------------
+  1D vs marginal              S1         38,972      10      64.15   10/10
+  1D vs 2D regime             S2         38,976      10      17.73   10/10
+  1D vs 2D regime             S3         63,589      10      37.67   10/10
+  1D vs vol_delta             S1         38,972      10      28.89   10/10
+  1D vs vol_delta             S2         38,976      10      34.73   10/10
+  1D vs vol_delta             S3         63,589      10      34.72   10/10
+  1D vs vol_delta             S7         75,885      10      25.05   10/10
+  1D vs ofi_window            S1         38,972      10       2.97    8/10
+  1D vs ofi_window            S2         38,976      10       5.45    9/10
+  1D vs ofi_window            S3         63,589      10       2.37    2/10*
+  1D vs ofi_window            S7         75,885      10       0.23    5/10
+  1D vs spread_delta          S1         38,972      10      12.65   10/10
+  1D vs spread_delta          S2         38,976      10      12.20   10/10
+  1D vs spread_delta          S3         63,589      10      28.48   10/10
+  1D vs spread_delta          S7         75,885      10      24.42   10/10
+
+  * S3: 1D wins on 2 of 10 seeds — i.e. ofi_window wins on 8 of 10.
+  All other rows: number of seeds on which 1D was the winner.
+
+INTERPRETATION
+  - 1D vs marginal:    decisive.  The thesis "state-conditioned > marginal" is proved.
+  - 1D vs 2D regime:   decisive.  Adding the Kalman regime axis on top of pressure HURTS at λ=0.1.
+  - 1D vs vol_delta:   decisive.  Always loses, big effect.
+  - 1D vs spread_delta:decisive.  Always loses, big effect.
+  - 1D vs ofi_window:  inconclusive. Wins once (S3, |t|=2.37, borderline),
+                       ties once (S7), loses twice (S1, S2).
+
+CHANCE BASELINE FOR CONTEXT
+  At |α|=0.05 (|t|≈2 for n=10), if you ran 16 independent comparisons
+  (4 sessions × 4 modes per session) you'd expect ~0.8 of them to cross
+  |t|=2 by pure chance. We saw exactly one borderline cross (B on S3,
+  |t|=2.37). That is consistent with sampling noise. It does NOT prove
+  ofi_window is luck — but it does mean we CANNOT rule out luck without
+  a second long session showing the same thing, and S7 did not.
+
+
+================================================================================
+ 4. THE TOXICITY BARRIER — the mechanistic story behind every loss
+================================================================================
+
+This is the unifying explanation for everything in figs 1-5 and the
+master table.
+
+THE COUPLING
+  Every signal we tested as a second axis is correlated with FILL
+  PROBABILITY in some way:
+    vol_delta:    rising vol → more activity at the touch → easier fills
+    spread_delta: widening spread → more limit room → easier fills
+    ofi_window:   sustained one-sided flow → more aggressive counter
+                  flow on the other side → more passive fills
+    Kalman regime:high vol regime → same as vol_delta
+
+  All of them light up in moments where a passive limit at the bid
+  WILL get crossed. The Hedge weight update sees those moments as
+  "PASSIVE pays off" and shifts mass towards PASSIVE in the matching
+  cell.
+
+THE TRAP
+  But the flow that crosses your passive bid is, on average, the
+  flow that has a price-adverse reason to do so:
+    - selling pressure crosses your bid because price is dropping
+    - aggressive sells eat through limit-bid liquidity in advance of
+      the next price level
+
+  So passive fills LOOK profitable on the slippage-only metric (you
+  earned the half-spread) but they are systematically followed by
+  unfavorable mid-price moves. The ratio in our data:
+    PASSIVE adverse_move ≈ 2.0× the AGGRESSIVE adverse_move
+    PASSIVE slippage     ≈ -$0.005 / fill (gain)
+    AGGRESSIVE slippage  ≈ +$0.005 / fill (cost)
+    Per fill, the "saved" half-spread is one-quarter of a cent;
+    the extra adverse risk per fill is ~$0.50-$1.50 of mid-move.
+
+THE λ CALCULATION
+  Total cost = slippage + λ * adverse_move
+
+  At λ=0:    only slippage counts → PASSIVE wins → all our 2D variants win
+  At λ=0.1:  adverse swamps → 1D's "skip the toxic moments" wins
+  At λ=1.0:  adverse really swamps → AGGRESSIVE-heavy is better
+
+  λ=0.1 was set in §9 by matching std(slippage)/std(adverse) so that
+  the policy can't trivially game the slippage axis. It is also where
+  the original WAIT vs AGGRESSIVE expected losses are nearly tied (§9).
+  We are operating in the regime where toxicity dominates — and that
+  is the realistic regime for an execution desk that cares about $ P&L.
+
+THE CONSEQUENCE
+  Every policy that has more parameters than 1D ends up using them to
+  identify "fill-good" moments and shifting toward PASSIVE in those
+  moments. They all walk up-and-left along the same Pareto frontier
+  in fig 5. None of them escape. The pressure-only 1D policy escapes
+  ONLY because it has too few cells to overfit fill-quality moments
+  — its 6 buckets only learn the broadest "buyer pressure → AGGR,
+  seller pressure → WAIT" pattern, which happens to also be the
+  toxicity-correct pattern.
+
+  In other words, 1D wins because it can't see the trap.
+
+WHY THIS MATTERS FOR THE FINAL CHAPTER
+  No further STATE conditioning will help, because state conditioning
+  in this action space inevitably routes more flow to PASSIVE. To
+  beat 1D you have to change the action space so that the policy can
+  express decisions that are NOT "post a passive bid" when toxicity
+  rises.
+
+
+================================================================================
+ 5. WHAT WE STAND BY (the credible claims)
+================================================================================
+
+These are the statements we believe are robust enough to publish:
+
+C1. The Kalman → Hedge architecture works.
+    On clean data, marginal Hedge converges to a sensible action
+    distribution. The §13 retune showed +19% improvement on every
+    metric at every λ when R and λ were calibrated correctly. The
+    pipeline is sound.
+
+C2. State-conditioning on market_pressure is a real, large win.
+    On S1 (the only session where we ran the marginal vs 1D test),
+    1D bucketed beat marginal Hedge by +29% in combined loss with
+    paired |t|=64 across 10 seeds. The Kalman pressure dimension
+    earns its keep.
+
+C3. State-conditioning on EVERY second axis we tried is NOT a win.
+    Across 4 sessions and 4 candidate second axes (Kalman regime,
+    vol_delta, spread_delta, ofi_window), no policy with a second
+    axis achieved |t|≥2.0 dominance over 1D on more than one
+    session. Three of the four lost on every session. The fourth
+    (ofi_window) won on one session at the very edge of significance
+    and failed to reproduce on a bigger session.
+
+C4. The mechanism behind C3 is the toxicity barrier.
+    Every richer policy takes more PASSIVE actions (+1.4 to +2.5pp).
+    PASSIVE saves spread but is preferentially filled at toxic
+    moments. At λ=0.1 the adverse cost overwhelms the spread
+    savings. This is reproduced on every session in the action-mix
+    plot (fig 4) and in the slip-vs-adverse Pareto plot (fig 5).
+
+C5. Sample size is NOT the bottleneck for the negative results.
+    On S3 (63k ticks), the 18 inner cells of 2D each had 2,000-
+    12,000 ticks (sanity §23). 2D still lost. ofi_window had MORE
+    data per cell on S7 than S3, and its win shrank instead of
+    growing. Adding more ticks per cell does not fix the toxicity
+    coupling.
+
+C6. The bucket family of policies has hit its ceiling.
+    Three independent attempts at richer state conditioning have
+    failed in the same mechanistic way. We have crossed the
+    threshold from "we should try the next signal" to "we should
+    change the approach."
+
+These six claims together are the credible story of the project.
+
+
+================================================================================
+ 6. WHAT WE DO NOT YET KNOW (honestly stated)
+================================================================================
+
+U1. Whether 1D's +29% advantage over marginal generalizes across
+    sessions.
+    We have only run marginal vs 1D on S1. To make C2 truly robust
+    we should re-run that A/B on S2, S3, S7. ~1-3 minutes of compute
+    per session. Cheap and worth doing as a sanity confirmation.
+
+U2. Whether ofi_window has a "trending market regime" where it
+    really does beat 1D.
+    Hypothesis B from sanity §25. Could be tested by capturing
+    sessions with explicit directional drift labels (e.g. "mid moved
+    by >3% over the session") and stratifying. We do not have enough
+    such sessions yet.
+
+U3. Whether the inverted-A and inverted-C policies (be MORE aggressive
+    when vol/spread is rising, instead of more passive) work.
+    Sanity §26 conjecture. Cheap to code in hedge_adverse.py — flip
+    the sign of the secondary buckets' learning. Real chance this
+    converts a -|t|=25 loss into something useful, because the
+    signals ARE informative; we may just be reading them backward.
+
+U4. Whether 6×2 ofi_window (binary "net buying / net selling")
+    fixes the cell-thinness problem on small sessions.
+    Mentioned in sanity §25 next-steps. Cheap to test — one config
+    change.
+
+U5. Whether the toxicity barrier collapses at higher tick frequency
+    or different markets.
+    Outside the scope of this project but worth flagging.
+
+These five items are the honest "if we had another month" list.
+
+
+================================================================================
+ 7. FINAL CREDIBLE IDEA — the next thesis chapter
+================================================================================
+
+The experimental work above gives us a clean negative result: the bucket
+family of state-conditioned Hedge policies has hit a ceiling because
+every richer second axis routes the policy into more toxic passive
+fills. The bottleneck is not the state space. It is the action space.
+
+PROPOSAL: SIZE-CONDITIONED HEDGE
+  Change the action space from 3 actions to 7-9 actions:
+
+    OLD action set (current):   {WAIT, PASSIVE_1, AGGRESSIVE_1}
+    NEW action set (proposed):  {WAIT,
+                                 PASSIVE_05, PASSIVE_1, PASSIVE_2,
+                                 AGGRESSIVE_05, AGGRESSIVE_1, AGGRESSIVE_2}
+
+  where the suffix is the order size in BTC (0.5, 1, or 2). The agent
+  is still forced to BUY 1 BTC every tick on average, but can express
+  the size as a function of state through Hedge weights over a richer
+  action set.
+
+  Conditioning stays at 1D pressure-bucketed (the proven winner).
+  Math stays as Hedge per bucket. Only the action set changes.
+
+WHY THIS BREAKS THE TOXICITY BARRIER
+  Right now the policy has only one tool when it sees a "fill-easy"
+  moment: post a passive limit order. Posting that order in a toxic
+  moment is the trap.
+
+  With size in the action set, the policy can:
+    - in clearly-buyer-pressure cells, take AGGRESSIVE_2 to grab more
+      cheap inventory, and PASSIVE_05 only when really cheap
+    - in clearly-seller-pressure cells, take WAIT or PASSIVE_05 to
+      reduce exposure to toxicity (smaller fill = smaller adverse
+      cost)
+    - in neutral pressure cells (where the toxicity trap lives),
+      pick PASSIVE_05 instead of PASSIVE_1, which halves the
+      adverse-move exposure per fill
+
+  In other words: the policy can MODULATE the toxicity exposure by
+  moving along a different axis (size) than the spread axis. This is
+  a NEW Pareto frontier, not a new point on the old one.
+
+WHY THIS IS CHEAP TO IMPLEMENT
+  - actions.py: extend Action enum from 3 to 7-9 values.
+  - simulator.py: scale slippage / adverse_move proportionally to
+    action size. Already a 1-BTC-per-tick simulator; just multiply.
+  - loss.py: nothing changes (slippage and adverse already scale).
+  - hedge.py: classical Hedge over K actions works for any K.
+    Initial uniform weights = 1/K. Update rule unchanged. Regret
+    bound still O(√(T log K)).
+  - configs/policy.yaml: add `action_sizes: [0.5, 1.0, 2.0]`.
+
+  Net effort: ~half a day of code. Re-uses S1, S2, S3, S7 features
+  we already have. Same A/B harness (modify scripts/_ab_session3_10seed.py
+  to use the new action set).
+
+WHAT TO MEASURE
+  1. Total combined loss vs 1D baseline (the fixed-size version) at
+     λ=0.1 on all 4 sessions, paired by seed.
+  2. Average size per fill, per pressure bucket. The hypothesis is
+     that the policy will pick larger sizes in extreme-pressure
+     buckets (where the action is correct) and smaller sizes in
+     neutral buckets (where toxicity hides).
+  3. Slip vs adverse Pareto: does the new policy land on a STRICTLY
+     better point in fig 5's plot, or does it just walk along the
+     same frontier with a different slope?
+
+PREDICTION
+  At λ=0.1, the size-conditioned policy beats 1D fixed-size by
+  5-15% in combined loss across all 4 sessions, with paired |t|>3
+  on at least the two long sessions. Mechanism: smaller passive
+  fills in neutral cells reduce adverse_move proportionally,
+  while larger aggressive fills in clearly-directional cells
+  pick up "free" inventory at known-favorable moments. The
+  Pareto plot shows the new policy moves DOWN-LEFT off the
+  1D point on every session.
+
+ALTERNATIVE / FALLBACK CHAPTER
+  If size conditioning also fails, the next decision-shape change
+  is multi-tick planning: at each tick, the agent sees current
+  state and outputs a SHORT plan (e.g. "WAIT now, AGGRESSIVE_1 if
+  pressure stays low for next 2 ticks, otherwise PASSIVE_1"). This
+  is a richer space but harder to fit into Hedge directly — would
+  likely require EXP4 with a small expert set or a contextual
+  bandit. More complex but scientifically novel; only fall back to
+  it if size conditioning runs into a similar dead end.
+
+
+================================================================================
+ 8. CONCRETE PLAN OF ACTION FOR THE NEXT SESSION
+================================================================================
+
+Order from cheapest / highest-value first:
+
+  Step 1   Confirm C2 is multi-session.
+           Run marginal vs 1D on S2, S3, S7 (10 seeds each).
+           Wall-clock: ~3 min total.
+           Outcome: a 4-session table mirroring the §15 result. Locks
+                    down the headline claim.
+
+  Step 2   Implement size-conditioned action set.
+           - extend Action enum
+           - update simulator + loss
+           - config: action_sizes
+           - extend BucketedHedgePolicy to K actions (already general)
+           Wall-clock: ~half a day.
+
+  Step 3   Run size-conditioned vs 1D fixed-size A/B.
+           4 sessions × 10 seeds × 2 modes = 80 runs.
+           Wall-clock: ~4 min.
+           Outcome: paired |t|, action mix per bucket, slip-vs-adverse
+                    Pareto.
+
+  Step 4   If Step 3 wins on ≥2 sessions at |t|≥2.0 → write up as
+           the final chapter. Done.
+
+  Step 5   If Step 3 fails → invert vol_delta and spread_delta as
+           per sanity §26 next-steps (act MORE aggressive when those
+           signals fire). 4 × 10 × 2 = 80 runs. Wall-clock: ~4 min.
+
+  Step 6   If Steps 3-5 all fail → the project's final result is
+           the negative result itself. Write up the toxicity barrier
+           as the contribution: "at 100ms BTC, no second-axis state
+           conditioning escapes the spread-vs-toxicity Pareto
+           frontier; the only useful state is market_pressure."
+           That is publishable as-is.
+
+Either Step 3 or Step 6 is a credible thesis ending. Step 3 is the
+positive ending we hope for; Step 6 is the credible negative ending
+we have already earned.
+
+
+================================================================================
+ 9. APPENDIX — file pointers
+================================================================================
+
+Plots referenced above:
+  data/derived/figures/section25/fig01_total_loss_per_session.png
+  data/derived/figures/section25/fig02_paired_diff_vs_1d.png
+  data/derived/figures/section25/fig03_per_seed_scatter_ofi_window_vs_1d.png
+  data/derived/figures/section25/fig04_action_mix_per_session.png
+  data/derived/figures/section25/fig05_slippage_vs_adverse.png
+
+Raw data:
+  data/derived/ab_adverse_3sessions_10seed.json   — 4 × 10 × 4 = 160 runs
+  data/derived/ab_session3_apr30_10seed.json      — §23 1D vs 2D regime, S3
+  data/derived/ab_2d_vs_1d_apr28_10seed.json      — §21 1D vs 2D regime, S2
+
+Sanity.txt sections that compose this report:
+  §15  1D vs marginal (the original positive result)
+  §16  regime dimension fix (vol_30s standardization)
+  §18  S2 ingest verification
+  §20  5-seed 1D vs 2D regime, S2 (preliminary)
+  §21  10-seed 1D vs 2D regime, S2 (the big one)
+  §23  10-seed 1D vs 2D regime, S3 (reproducing on more data)
+  §24  10-seed 1D vs adverse-2D × 3 signals, S1+S2+S3 (first ofi_window win)
+  §25  10-seed adverse harness + S7 (the win that didn't reproduce)
+  §26  caveman-brain summary of §25
+
+Plot regenerator:
+  scripts/_plots_section25.py   (PYTHONPATH=. python …)
+
+Harness scripts:
+  scripts/_ab_adverse_3sessions.py   — 4 sessions × 10 seeds × 4 modes
+  scripts/_ab_session3_10seed.py     — single-session 1D vs 2D
+  scripts/_scheduled_daily_ab.py     — autopilot version (5 seeds, all sessions)
+
+
+================================================================================
+ END OF REPORT
+================================================================================

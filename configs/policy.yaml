@@ -27,11 +27,17 @@ initial_weight: 1.0
 #              bucket. This is the state-conditioned variant — actually USES
 #              the Kalman output.
 #
-# Run both modes on the same features for an A/B comparison.
+# "bucketed_2d" — BucketedHedge2DPolicy: one Hedge weight vector per
+#                 (market_pressure, regime) cell. Requires both
+#                 pressure_edges AND regime_edges. Used by
+#                 scripts/6_simulate_and_update_2d.py — that script forces
+#                 mode='bucketed_2d' regardless of this field.
+#
+# Run modes against each other on the same features for an A/B comparison.
 mode: bucketed
 
 # Cutpoints for the market_pressure dimension (ascending).
-# N edges → N+1 buckets. Only used when mode="bucketed".
+# N edges → N+1 buckets. Used by both 1D bucketed and 2D bucketed modes.
 #
 # Default edges below give 6 buckets roughly centred on 0 (observed
 # market_pressure has std ≈ 0.29 and range ≈ [-1.3, +2.1] on the first
@@ -44,3 +50,15 @@ mode: bucketed
 #   bucket 4:  0.2 < pressure <=  0.5
 #   bucket 5:  pressure >  0.5      (heavy buy pressure)
 pressure_edges: [-0.5, -0.2, 0.0, 0.2, 0.5]
+
+# Cutpoints for the regime dimension (ascending). Only used when
+# mode="bucketed_2d". N edges → N+1 buckets.
+#
+# Default edges below give 3 buckets matched to the post-§16 regime
+# distribution (mean≈0, p01=-0.50, p50=-0.07, p99=+1.22, occasional
+# spikes much higher):
+#
+#   bucket 0: regime <= -0.3   (calm — bottom ~20% of ticks)
+#   bucket 1: -0.3 < regime <= +0.3   (normal — middle ~60%)
+#   bucket 2: regime >  +0.3   (elevated / spike — top ~20%)
+regime_edges: [-0.3, 0.3]

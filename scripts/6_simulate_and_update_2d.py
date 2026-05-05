@@ -1,35 +1,21 @@
 """
-Script 6 — Full pipeline: Kalman → policy → simulate → loss → weight update.
+Script 6 (2D variant) — full pipeline with 2D state-conditioned Hedge.
 
-This is the main training run. It reads feature Parquet files, runs the
-complete tick-by-tick loop, and writes an execution log to
-data/derived/execution_log/run=<id>/date=YYYY-MM-DD/log.jsonl.
+Sibling of scripts/6_simulate_and_update.py. Identical structure, identical
+session detection, identical execution log layout. The ONLY difference is
+the policy: this script forces mode='bucketed_2d' so the policy maintains
+one Hedge weight vector per (market_pressure_bucket, regime_bucket) cell of
+a 2D grid, instead of one per pressure bucket.
 
-After this script completes, the execution log contains everything needed
-for validation and charting:
-  - What the Kalman filter estimated at every tick (market_pressure, regime)
-  - What action the policy chose and with what weights
-  - Whether the order filled and at what price
-  - The slippage, adverse move, and total loss
-  - How the weights evolved over time
-
-Session selection
------------------
-The Kalman filter is stateful — the estimate at tick t depends on every
-tick before it. Running across a discontinuity (WS disconnect, data gap,
-crossing a manual ingest restart) propagates a stale state across the
-gap. So this script automatically splits the feature data into
-"sessions" — contiguous runs of rows with no sequence_gap=True markers
-and no time gap larger than SESSION_GAP_THRESHOLD_MS.
-
-By default the script runs on the LONGEST detected session. You can pick
-a different one with --session N (1-indexed) or list them with
---list-sessions.
+Why a separate script?
+  Keeps the validated 1D bucketed run (sanity.txt §15) reproducible from
+  the same configs/policy.yaml without changing its `mode` field. Run both
+  scripts back to back for an apples-to-apples A/B on the same data.
 
 Run:
-  python3 scripts/6_simulate_and_update.py                   # longest session
-  python3 scripts/6_simulate_and_update.py --list-sessions   # show and exit
-  python3 scripts/6_simulate_and_update.py --session 2       # pick session 2
+  python3 scripts/6_simulate_and_update_2d.py                   # longest session
+  python3 scripts/6_simulate_and_update_2d.py --list-sessions   # show and exit
+  python3 scripts/6_simulate_and_update_2d.py --session 2       # pick session 2
 """
 
 from __future__ import annotations
@@ -47,30 +33,15 @@ from src.utils.config import load_config
 from src.utils.io import iter_parquet_dir
 from src.utils.logging import get_logger
 
-log = get_logger("6_simulate_and_update")
+log = get_logger("6_simulate_and_update_2d")
 
 FEATURES_DIR = Path("data/derived/features")
-
-# Any inter-tick gap > this is treated as a session boundary.
-# Normal ticks are ~1s; the largest observed gap in a clean stream is ~2s.
-# 5s gives comfortable margin without false-positives on normal jitter.
 SESSION_GAP_THRESHOLD_MS = 5_000
 
 
 def detect_sessions(rows: List[dict]) -> List[Tuple[int, int]]:
-    """Split rows into contiguous sessions.
-
-    A new session begins at:
-      - the first row
-      - any row with sequence_gap=True
-      - any row whose ts_ms exceeds the previous row's ts_ms by more than
-        SESSION_GAP_THRESHOLD_MS
-
-    Returns a list of (start_idx, end_idx_exclusive) pairs.
-    """
     if not rows:
         return []
-
     sessions: List[Tuple[int, int]] = []
     start = 0
     for i in range(1, len(rows)):
@@ -106,14 +77,9 @@ def pick_session(
     sessions: List[Tuple[int, int]],
     requested: int | None,
 ) -> Tuple[int, Tuple[int, int]]:
-    """Return (1-indexed session number, (start, end)) for the chosen session.
-
-    If requested is None, pick the longest session.
-    """
     if requested is None:
         idx = max(range(len(sessions)), key=lambda i: sessions[i][1] - sessions[i][0])
         return idx + 1, sessions[idx]
-
     if requested < 1 or requested > len(sessions):
         raise SystemExit(
             f"--session {requested} out of range; detected {len(sessions)} session(s). "
@@ -123,7 +89,9 @@ def pick_session(
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p.add_argument("--session", type=int, default=None,
                    help="1-indexed session to run (default: longest detected session)")
     p.add_argument("--list-sessions", action="store_true",
@@ -140,7 +108,14 @@ def main() -> None:
     policy_cfg    = load_config("configs/policy.yaml",    PolicyConfig)
     execution_cfg = load_config("configs/execution.yaml", ExecutionConfig)
 
-    # Load all feature rows once — we need random-access to detect sessions.
+    # Force 2D bucketing for this script regardless of the YAML's mode.
+    policy_cfg.mode = "bucketed_2d"
+    if not policy_cfg.regime_edges:
+        raise SystemExit(
+            "configs/policy.yaml is missing regime_edges. "
+            "Add e.g. `regime_edges: [-0.3, 0.3]` to enable 2D bucketing."
+        )
+
     rows = list(iter_parquet_dir(FEATURES_DIR))
     if not rows:
         raise SystemExit(f"No feature rows found under {FEATURES_DIR}.")
@@ -163,12 +138,17 @@ def main() -> None:
     policy = make_policy(policy_cfg, seed=args.seed)
 
     log.info(
-        "Starting run — mode=%s λ=%.2f η=%.3f",
-        policy_cfg.mode, execution_cfg.lambda_, policy_cfg.learning_rate,
+        "Starting run — mode=%s λ=%.2f η=%.3f seed=%s",
+        policy_cfg.mode, execution_cfg.lambda_, policy_cfg.learning_rate, args.seed,
     )
-    if policy_cfg.mode == "bucketed":
-        log.info("Pressure edges: %s  (%d buckets)",
-                 policy_cfg.pressure_edges, len(policy_cfg.pressure_edges) + 1)
+    log.info("Pressure edges: %s  (%d buckets)",
+             policy_cfg.pressure_edges, len(policy_cfg.pressure_edges) + 1)
+    log.info("Regime   edges: %s  (%d buckets)",
+             policy_cfg.regime_edges, len(policy_cfg.regime_edges) + 1)
+    log.info("2D grid: %d × %d = %d cells",
+             len(policy_cfg.pressure_edges) + 1,
+             len(policy_cfg.regime_edges) + 1,
+             (len(policy_cfg.pressure_edges) + 1) * (len(policy_cfg.regime_edges) + 1))
 
     total = run(
         feature_rows=iter(selected),
@@ -187,15 +167,15 @@ def main() -> None:
         final_weights[Action.AGGRESSIVE],
     )
 
-    if hasattr(policy, "bucket_summary"):
-        log.info("Per-bucket final weights:")
-        log.info("  %-6s %-22s %-8s %-10s %-10s %-10s",
-                 "bucket", "pressure range", "visits", "WAIT", "PASSIVE", "AGGR")
-        for b in policy.bucket_summary():
-            w = b["weights"]
-            log.info("  %-6d %-22s %-8d %-10.4f %-10.4f %-10.4f",
-                     b["bucket"], b["range"], b["visits"],
-                     w[Action.WAIT], w[Action.PASSIVE], w[Action.AGGRESSIVE])
+    log.info("Per-(pressure, regime)-bucket final weights:")
+    log.info("  %-6s %-22s %-22s %-8s %-10s %-10s %-10s",
+             "bucket", "pressure range", "regime range",
+             "visits", "WAIT", "PASSIVE", "AGGR")
+    for b in policy.bucket_summary():
+        w = b["weights"]
+        log.info("  %-6d %-22s %-22s %-8d %-10.4f %-10.4f %-10.4f",
+                 b["bucket"], b["p_range"], b["r_range"], b["visits"],
+                 w[Action.WAIT], w[Action.PASSIVE], w[Action.AGGRESSIVE])
 
     log.info("Execution log → %s", execution_cfg.output_dir)
 

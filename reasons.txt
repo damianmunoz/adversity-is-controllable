@@ -1,0 +1,282 @@
+================================================================================
+ REASONS — la narrativa para la defensa de tesis y entrevistas en hedge funds
+================================================================================
+
+Cómo justificar el arco "solver de poker → ejecución óptima en mercados",
+por qué el sandbox de 3 acciones es la simplificación correcta, cómo
+conectarlo al paper, y por qué este trabajo es buena tesis para entrar
+a un hedge fund.
+
+
+--------------------------------------------------------------------------------
+ La conexión real: poker solver y trading son el MISMO tipo de problema
+--------------------------------------------------------------------------------
+
+No es una analogía forzada. Hay una identificación matemática real entre
+solvers de poker y algoritmos de trading, y mucha gente en hedge funds lo
+sabe (Ed Thorp, Aaron Brown, los primeros cuants de Renaissance, todos
+venían de juegos). Esta es la historia que vas a contar:
+
+
+--------------------------------------------------------------------------------
+ ARCO NARRATIVO (defensa + entrevistas)
+--------------------------------------------------------------------------------
+
+Fase 1 — La idea original: solver de poker.
+
+  "Cuando empecé esta tesis, yo quería construir un solver de poker en
+  miniatura. Lo que estos solvers (PioSolver, GTO+) hacen es: dado un
+  estado del juego (mano, posición, tamaño del stack, historia de
+  acciones), computan una distribución de probabilidades sobre acciones
+  (fold, call, raise) que se acerca al equilibrio de Nash. Bajo el capó
+  usan algoritmos de la familia Counterfactual Regret Minimization — un
+  primo cercano del Hedge."
+
+
+Fase 2 — La realización: la microestructura de mercado tiene la misma
+estructura matemática.
+
+  "Cuando empecé a leer sobre ejecución algorítmica, me di cuenta que
+  el problema tiene la misma forma estructural que el poker:
+
+   - Hay un ESTADO OCULTO (en poker: las cartas del oponente; en
+     mercados: la presión real del flujo de órdenes).
+   - Hay OBSERVACIONES RUIDOSAS del estado (en poker: las apuestas del
+     oponente revelan su mano; en mercados: el libro de órdenes revela
+     la presión).
+   - Hay un CONJUNTO DISCRETO DE ACCIONES que tomar (fold/call/raise;
+     WAIT/PASSIVE/AGGRESSIVE).
+   - Cada acción tiene un COSTO DEPENDIENTE DEL ESTADO que sólo
+     aprendés post-hoc (ganaste o perdiste la mano; ahorraste o perdiste
+     dinero en el fill).
+   - Querés UNA DISTRIBUCIÓN DE PROBABILIDADES POR ESTADO — no una
+     acción determinista — porque el problema es estocástico y los
+     oponentes (o el mercado) pueden adaptarse."
+
+
+Fase 3 — El pivote: cambiar el "oponente".
+
+  "En poker, el oponente es un humano que estratégicamente trata de
+  explotarte. Eso hace al problema teóricamente más limpio (Nash
+  equilibrium) pero prácticamente más difícil — no podés generar datos
+  de entrenamiento sin jugar millones de manos contra humanos. En
+  microestructura, el 'oponente' es el mercado: no estratégico contra
+  vos personalmente, pero con estructura estadística observable. Y los
+  datos son GRATIS Y ABUNDANTES (Binance WebSocket público).
+
+  Hice el pivote: en lugar de 'solver de poker' construí un 'solver de
+  ejecución'. Misma estructura algorítmica, problema más tratable
+  empíricamente."
+
+
+Fase 4 — La simplificación al sandbox de 3 acciones.
+
+  "Para mantener el problema tratable, lo simplifiqué deliberadamente:
+
+   - Forzo que el agente SIEMPRE COMPRA 1 BTC cada tick. Esto elimina
+     la pregunta '¿debería operar?' (que es trading) y deja sólo
+     '¿cómo opero?' (que es ejecución óptima).
+
+   - Las acciones se reducen a TRES:
+       WAIT       (no actúo este tick — análogo a fold)
+       PASSIVE    (orden límite — análogo a call, paciente y barato
+                   pero incierto)
+       AGGRESSIVE (orden a mercado — análogo a raise, garantizado
+                   pero caro)
+
+  Esa tricotomía no es arbitraria — es la decomposición canónica de
+  cualquier problema secuencial donde podés 'no participar / participar
+  pasivamente / comprometerte'. La encontrás en poker, en ejecución
+  algorítmica, y en muchos problemas de control."
+
+
+Fase 5 — Por qué ese marco produce una buena tesis.
+
+  "Lo elegante de esta formulación es que cada componente del sistema
+  es 'best-in-class' en su nicho:
+
+   - Para estimar el estado oculto del mercado: filtro de Kalman
+     (óptimo bajo ruido gaussiano lineal — todo libro de control de
+     los últimos 60 años empieza ahí).
+
+   - Para seleccionar acción bajo feedback parcial: Hedge /
+     multiplicative weights (la familia que también incluye CFR, los
+     algoritmos de poker, y muchas estrategias online de portfolio).
+
+   - El acoplamiento Kalman → Hedge es modular: cada bloque se prueba
+     por separado, lo que es importante para una tesis donde tengo que
+     defender cada decisión.
+
+  La pregunta de investigación que terminé contestando — 'condicionar
+  la política sobre el estado estimado vence al baseline sin estado, y
+  por qué cualquier segundo eje de estado falla' — fue una sorpresa.
+  No la vi venir. Eso es lo que hace que sea tesis y no ingeniería."
+
+
+--------------------------------------------------------------------------------
+ CÓMO CONECTARLO AL PAPER
+--------------------------------------------------------------------------------
+
+El paper que ya escribiste lo cubre, pero hay tres líneas que valdría
+la pena enfatizar más explícitamente:
+
+1. En la INTRODUCCIÓN, agrega una frase sobre el linaje algorítmico:
+   "El algoritmo Hedge que usamos pertenece a la misma familia
+   matemática (multiplicative weights) que los solvers de equilibrio
+   en juegos como el Counterfactual Regret Minimization usado en
+   poker. Ambos son procedimientos de no-regret aplicados a decisiones
+   secuenciales bajo feedback parcial."
+
+2. En la SECCIÓN DE TRABAJOS RELACIONADOS, ya tenés Cover (1991)
+   (Universal Portfolios, que es Hedge aplicado a selección de
+   cartera). Podrías agregar:
+   - Brown & Sandholm (2018) "Superhuman AI for heads-up no-limit
+     poker" — usa CFR
+   - Heinrich & Silver (2016) "Deep reinforcement learning from
+     self-play in imperfect-information games" — el puente entre
+     juegos y RL financiero
+
+3. En la SECCIÓN DE SIMULADOR, puedes mencionar explícitamente:
+   "El sandbox de tres acciones (WAIT/PASSIVE/AGGRESSIVE) es la
+   decomposición canónica de cualquier problema de ejecución óptima
+   en mercados de doble subasta — análoga a fold/call/raise en juegos
+   secuenciales con apuestas. Esta abstracción permite aislar el
+   problema de cómo ejecutar de la pregunta separada de si ejecutar."
+
+
+--------------------------------------------------------------------------------
+ POR QUÉ ES BUENA TESIS PARA ENTRAR A UN HEDGE FUND
+--------------------------------------------------------------------------------
+
+Acá está la propuesta de valor para una entrevista. Esto es lo que un
+quant senior va a valorar:
+
+
+1. DEMOSTRÁS DOMINIO DE LAS HERRAMIENTAS QUE USAN ELLOS
+
+   Herramienta                          Dónde aparece en tu tesis
+   -----------------------------------------------------------------
+   Kalman filter                        Bloque central. Toda firma
+                                        cuant lo usa para inferencia
+                                        de estados latentes (alfas,
+                                        factores, volatilidad).
+   Multiplicative weights / Hedge       El controlador. Aparece en
+                                        Online Portfolio Selection,
+                                        smart order routing,
+                                        market-making.
+   Microestructura: OFI, depth          Tus features. Cont, Kukanov,
+   imbalance, microprice                Stoikov son lectura obligatoria
+                                        en cualquier mesa de HFT.
+   A/B testing pareado                  Tu metodología. Las firmas
+                                        serias hacen *exactamente* esto
+                                        antes de promover una
+                                        estrategia a producción.
+
+   Cuando te pregunten "¿qué hiciste en tu tesis?" tu respuesta natural
+   usa las herramientas que ellos usan a diario.
+
+
+2. DEMOSTRÁS DISCIPLINA DE RESEARCH EMPÍRICA
+
+   La regla de las dos sesiones, los 10 seeds pareados, el resultado
+   negativo robusto, el debugging del bug del libro corrupto en §1 —
+   todo esto es RESEARCH PROCESS que vale en HFT. La gente que hace
+   claims sin validar dura 6 meses; la gente que hace lo que vos hiciste
+   dura 20 años.
+
+   FRASE PARA LA ENTREVISTA:
+   "Antes de promover cualquier resultado, requerí replicación cruzada
+   de sesiones — porque me di cuenta que con 16 comparaciones
+   independientes a |t|=2 esperás 0.8 falsos positivos por azar. Cuando
+   ofi_window ganó en una sesión a |t|=2.37 y luego fracasó en la
+   siguiente, no escribí 'avance prometedor', escribí 'no replicó'.
+   Hedge funds que respeto valoran ese tipo de disciplina más que un
+   resultado positivo bonito."
+
+
+3. DEMOSTRÁS DOMINIO DE UN RESULTADO NEGATIVO BIEN EXPLICADO
+
+   Esto es CRÍTICO. La mayoría de las tesis de ML/finanzas son "X
+   mejora Y por Z%". La tuya tiene un resultado positivo (1D vence
+   marginal) Y un resultado negativo mecanístico (la barrera de
+   toxicidad). El resultado negativo es LA PARTE MÁS VALIOSA para un
+   quant senior porque:
+
+   - Muestra que entendés POR QUÉ algo no funciona, no sólo QUE no
+     funcionó.
+   - Muestra que sabés diseñar experimentos para falsear hipótesis
+     específicas (cuatro señales independientes, mismo modo de falla).
+   - Te da una "war story" para contar — "probé cuatro segundos ejes y
+     los cuatro fallaron por la misma razón mecanística" es una
+     historia que se recuerda.
+
+   FRASE PARA LA ENTREVISTA:
+   "El resultado más sorprendente de mi tesis es la barrera de
+   toxicidad: probé cuatro señales mecanísticamente distintas como
+   segundo eje de un Hedge condicionado, y las cuatro fallaron
+   exactamente igual — saturando hacia más fills pasivos en momentos
+   donde esos fills son tóxicos. Esa convergencia me dijo que el techo
+   de la familia bucketed-Hedge no es por una mala elección de feature,
+   sino por una propiedad estructural del trade-off slippage-vs-adverse
+   a esta frecuencia. Eso me llevó a proponer cambiar el espacio de
+   acciones (size-conditioning) en lugar del espacio de estado, que es
+   lo que un controlador de ejecución industrial haría."
+
+
+4. LA CONEXIÓN POKER → TRADING ES REAL Y LA CONOCEN
+
+   En las primeras entrevistas con hedge funds — sobre todo los
+   cuant-heavy como Jane Street, Two Sigma, Citadel, Susquehanna —
+   hablar de poker bien (no como hobby, sino como modelo formal) es una
+   SEÑAL POSITIVA. Susquehanna *literalmente* entrena a sus traders
+   junior con torneos de poker. Hablan el lenguaje de teoría de juegos.
+
+   FRASE PARA LA ENTREVISTA:
+   "Empecé esta tesis queriendo escribir un solver simple de poker
+   porque me parecía un problema bonito. Cuando estudié la literatura,
+   me di cuenta que un problema de ejecución óptima a alta frecuencia
+   tiene la misma estructura matemática — estado oculto, acciones
+   discretas, feedback parcial, distribución de probabilidades por
+   estado — pero con la ventaja de tener data libre y abundante en
+   lugar de tener que jugar millones de manos. Roté la tesis hacia
+   microestructura por eso, y la conexión teórica con poker (CFR y
+   Hedge están en la misma familia de algoritmos no-regret) es una de
+   las razones por las que la tesis es coherente conceptualmente."
+
+
+--------------------------------------------------------------------------------
+ RESUMEN PARA LA DEFENSA (un párrafo, ~200 palabras)
+--------------------------------------------------------------------------------
+
+"Esta tesis nació de un interés en solvers de poker — algoritmos que
+computan distribuciones de probabilidades sobre acciones para problemas
+secuenciales con información parcial. Cuando estudié la literatura me
+di cuenta que el problema de ejecución óptima en mercados a alta
+frecuencia tiene la misma estructura matemática: estado oculto (presión
+latente del flujo de órdenes), observaciones ruidosas (libro de
+órdenes), conjunto discreto de acciones (WAIT, PASSIVE, AGGRESSIVE —
+análogo a fold, call, raise), y feedback parcial (sólo observas el
+resultado de la acción que tomaste). Roté hacia microestructura porque
+los datos son abundantes y públicos donde los datos de poker no lo son.
+Construí un sandbox donde el agente está obligado a comprar 1 BTC por
+tick para aislar el problema de ejecución del problema de timing del
+trading. La arquitectura — filtro de Kalman para estimar estado, Hedge
+para selección de acción — usa herramientas estándar de la industria de
+hedge funds (filtros de Kalman para alfas latentes, multiplicative
+weights para selección online, ambas herramientas que aparecen en
+literatura aplicada). Los resultados muestran un efecto positivo robusto
+(state-conditioning vence a marginal) y un resultado negativo
+mecanístico (la barrera de toxicidad — ningún segundo eje de estado
+escapa al trade-off Pareto), que sugiere la dirección correcta para el
+siguiente capítulo: cambiar el espacio de acciones, no el espacio de
+estado."
+
+
+--------------------------------------------------------------------------------
+ CIERRE
+--------------------------------------------------------------------------------
+
+Esa narrativa funciona en defensa de tesis y en entrevistas de hedge
+fund, sin sonar forzada y sin tener que pretender que sabías desde el
+día uno cómo iba a terminar todo. Mostrás la EVOLUCIÓN DEL PENSAMIENTO
+— que es lo que un quant senior quiere ver, no un proyecto pre-cocinado.

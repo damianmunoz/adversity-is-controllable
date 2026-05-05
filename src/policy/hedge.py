@@ -55,15 +55,18 @@ class PolicyConfig:
     """Mirrors configs/policy.yaml.
 
     `mode` selects the policy variant:
-      "marginal" — classical Hedge with a single weight vector (default).
-      "bucketed" — BucketedHedgePolicy: one Hedge per market_pressure bucket,
-                   so learned weights differ across regimes. Requires
-                   `pressure_edges` (N-1 cutpoints → N buckets).
+      "marginal"    — classical Hedge with a single weight vector (default).
+      "bucketed"    — BucketedHedgePolicy: one Hedge per market_pressure
+                      bucket. Requires `pressure_edges`.
+      "bucketed_2d" — BucketedHedge2DPolicy: one Hedge per
+                      (market_pressure, regime) bucket. Requires both
+                      `pressure_edges` and `regime_edges`.
     """
     learning_rate:  float        # η — step size for the multiplicative update
     initial_weight: float        = 1.0
     mode:           str          = "marginal"
     pressure_edges: List[float]  = field(default_factory=list)
+    regime_edges:   List[float]  = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -359,18 +362,152 @@ class BucketedHedgePolicy:
 
 
 # ---------------------------------------------------------------------------
+# 2D bucketed (state-conditioned on (market_pressure, regime))
+# ---------------------------------------------------------------------------
+
+class BucketedHedge2DPolicy:
+    """State-conditioned Hedge with TWO state dimensions.
+
+    The 1D BucketedHedgePolicy buckets only on market_pressure. With the
+    regime dimension now alive (sanity.txt §16), we can finally condition on
+    BOTH state estimates at once: maintain one Hedge weight vector per
+    (pressure_bucket, regime_bucket) cell of a 2D grid.
+
+    Why this might help:
+      Pressure tells you DIRECTION (people pushing up vs down). Regime tells
+      you VOLATILITY (calm vs turbulent). The optimal action is plausibly
+      different in "heavy buy + calm" (linger as PASSIVE, no rush) vs
+      "heavy buy + turbulent" (go AGGRESSIVE before the price runs away).
+      A 1D pressure-only policy averages those two situations together.
+
+    Why this might NOT help:
+      Splitting buckets thins the data per bucket. With 6 pressure buckets
+      and 3 regime buckets we get 18 cells; on 38k ticks that is ~2k per
+      cell on average, but in practice a few cells will be sparse (especially
+      the corners — extreme pressure AND extreme regime simultaneously).
+      Sparse buckets give noisy weights. If regime carries no useful
+      conditional information, 2D will lose to 1D simply because each cell
+      has fewer updates to learn from.
+
+    Storage layout:
+      Buckets are flattened: bucket_index = p_idx * n_regime + r_idx.
+
+    Interface matches HedgePolicy / BucketedHedgePolicy: select(), update(),
+    weights() (returns the most recently selected bucket's weights). Adds
+    bucket_summary() for full post-run inspection of all 2D cells.
+    """
+
+    def __init__(self, config: PolicyConfig, seed: Optional[int] = None) -> None:
+        if config.mode != "bucketed_2d":
+            raise ValueError(
+                f"BucketedHedge2DPolicy requires mode='bucketed_2d', got '{config.mode}'"
+            )
+        if not config.pressure_edges:
+            raise ValueError("BucketedHedge2DPolicy requires non-empty pressure_edges")
+        if not config.regime_edges:
+            raise ValueError("BucketedHedge2DPolicy requires non-empty regime_edges")
+        if list(config.pressure_edges) != sorted(config.pressure_edges):
+            raise ValueError("pressure_edges must be in ascending order")
+        if list(config.regime_edges) != sorted(config.regime_edges):
+            raise ValueError("regime_edges must be in ascending order")
+
+        self.config   = config
+        self._rng     = np.random.default_rng(seed)
+        self._p_edges = list(config.pressure_edges)
+        self._r_edges = list(config.regime_edges)
+        self._n_p     = len(self._p_edges) + 1
+        self._n_r     = len(self._r_edges) + 1
+        n_total       = self._n_p * self._n_r
+
+        w_init = config.initial_weight
+        uniform_total = w_init * len(_ACTIONS)
+        self._buckets: List[Dict[Action, float]] = [
+            {a: w_init / uniform_total for a in _ACTIONS}
+            for _ in range(n_total)
+        ]
+        self._visits: List[int] = [0] * n_total
+        self._last_bucket: int  = 0  # valid after the first select()
+
+    def _which_bucket(self, market_pressure: float, regime: float) -> int:
+        pi = bisect.bisect_right(self._p_edges, market_pressure)
+        ri = bisect.bisect_right(self._r_edges, regime)
+        return pi * self._n_r + ri
+
+    def select(self, ctx: PolicyContext) -> PolicyDecision:
+        bucket = self._which_bucket(ctx.market_pressure, ctx.regime)
+        self._last_bucket = bucket
+        self._visits[bucket] += 1
+
+        w = self._buckets[bucket]
+        probs = [w[a] for a in _ACTIONS]
+        idx = int(self._rng.choice(len(_ACTIONS), p=probs))
+        chosen = _ACTIONS[idx]
+
+        log.debug(
+            "ts=%d bucket=%d pressure=%.3f regime=%.3f select=%s probs=[%.3f,%.3f,%.3f]",
+            ctx.ts_ms, bucket, ctx.market_pressure, ctx.regime, chosen.value,
+            probs[0], probs[1], probs[2],
+        )
+
+        return PolicyDecision(
+            ts_ms=ctx.ts_ms,
+            action=chosen.value,
+            prob_wait=probs[0],
+            prob_passive=probs[1],
+            prob_aggressive=probs[2],
+            weight_wait=probs[0],
+            weight_passive=probs[1],
+            weight_aggressive=probs[2],
+        )
+
+    def update(self, action: Action, loss: float) -> None:
+        w = self._buckets[self._last_bucket]
+        w[action] *= math.exp(-self.config.learning_rate * loss)
+        total = sum(w.values())
+        for a in w:
+            w[a] /= total
+
+    def weights(self) -> Dict[Action, float]:
+        return dict(self._buckets[self._last_bucket])
+
+    def bucket_summary(self) -> List[Dict]:
+        """Per-(pressure, regime)-bucket visit counts and final weights."""
+        summaries: List[Dict] = []
+        for pi in range(self._n_p):
+            p_lo = "-inf"        if pi == 0                  else f"{self._p_edges[pi-1]:+.3f}"
+            p_hi = "+inf"        if pi == len(self._p_edges) else f"{self._p_edges[pi]:+.3f}"
+            for ri in range(self._n_r):
+                r_lo = "-inf"    if ri == 0                  else f"{self._r_edges[ri-1]:+.3f}"
+                r_hi = "+inf"    if ri == len(self._r_edges) else f"{self._r_edges[ri]:+.3f}"
+                b = pi * self._n_r + ri
+                summaries.append({
+                    "bucket":  b,
+                    "p_range": f"({p_lo}, {p_hi}]",
+                    "r_range": f"({r_lo}, {r_hi}]",
+                    "visits":  self._visits[b],
+                    "weights": dict(self._buckets[b]),
+                })
+        return summaries
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
 def make_policy(config: PolicyConfig, seed: Optional[int] = None):
     """Instantiate the policy variant selected by config.mode.
 
-    Returns an object with select()/update()/weights() compatible with both
-    variants. BucketedHedgePolicy additionally exposes bucket_summary().
+    Returns an object with select()/update()/weights() compatible with all
+    variants. Bucketed variants additionally expose bucket_summary().
     """
     mode = (config.mode or "marginal").lower()
     if mode == "marginal":
         return HedgePolicy(config, seed=seed)
     if mode == "bucketed":
         return BucketedHedgePolicy(config, seed=seed)
-    raise ValueError(f"Unknown policy mode '{config.mode}'. Expected 'marginal' or 'bucketed'.")
+    if mode == "bucketed_2d":
+        return BucketedHedge2DPolicy(config, seed=seed)
+    raise ValueError(
+        f"Unknown policy mode '{config.mode}'. "
+        f"Expected 'marginal', 'bucketed', or 'bucketed_2d'."
+    )

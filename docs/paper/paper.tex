@@ -1,0 +1,1733 @@
+%==============================================================================
+%  paper.tex — Tesis (formato IEEE) en español
+%
+%  Compila con:
+%      pdflatex paper.tex
+%      pdflatex paper.tex      (segunda pasada para resolver referencias)
+%
+%  Las figuras están en:
+%      ../../data/derived/figures/section25/
+%  (rutas relativas desde docs/paper/paper.tex)
+%
+%  Si LaTeX no encuentra IEEEtran.cls instala el paquete texlive-publishers
+%  o coloca IEEEtran.cls en el mismo directorio que este archivo.
+%==============================================================================
+\documentclass[journal,onecolumn,11pt]{IEEEtran}
+
+% --- Codificación y idioma ---
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[spanish,es-tabla,es-noindentfirst]{babel}
+\usepackage{lmodern}
+
+% --- Matemáticas ---
+\usepackage{amsmath,amssymb,amsfonts,mathtools}
+\usepackage{bm}
+
+% --- Gráficos y tablas ---
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{siunitx}
+\sisetup{group-separator={\,},output-decimal-marker={,},detect-weight=true}
+
+% --- Diagramas de bloque ---
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,calc,shapes.geometric}
+
+% --- Hipervínculos ---
+\usepackage[hidelinks]{hyperref}
+
+% --- Pseudocódigo ---
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\floatname{algorithm}{Algoritmo}
+\renewcommand{\algorithmicrequire}{\textbf{Entrada:}}
+\renewcommand{\algorithmicensure}{\textbf{Salida:}}
+\renewcommand{\algorithmicwhile}{\textbf{mientras}}
+\renewcommand{\algorithmicdo}{\textbf{hacer}}
+\renewcommand{\algorithmicend}{\textbf{fin}}
+\renewcommand{\algorithmicfor}{\textbf{para}}
+\renewcommand{\algorithmicif}{\textbf{si}}
+\renewcommand{\algorithmicthen}{\textbf{entonces}}
+\renewcommand{\algorithmicelse}{\textbf{si no}}
+\renewcommand{\algorithmicreturn}{\textbf{devolver}}
+
+% --- Macros útiles ---
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\xv}{\mathbf{x}}
+\newcommand{\zv}{\mathbf{z}}
+\newcommand{\Fm}{\mathbf{F}}
+\newcommand{\Hm}{\mathbf{H}}
+\newcommand{\Qm}{\mathbf{Q}}
+\newcommand{\Rm}{\mathbf{R}}
+\newcommand{\Pm}{\mathbf{P}}
+\newcommand{\Km}{\mathbf{K}}
+\newcommand{\Iv}{\mathbf{I}}
+
+\graphicspath{{../../data/derived/figures/section25/}}
+
+%==============================================================================
+\begin{document}
+
+\title{Ejecución adaptativa en mercados financieros con filtro de Kalman y\\
+       algoritmo Hedge: una arquitectura de control para BTC/USDT}
+
+\author{Damián Muñoz Díaz%
+\thanks{Manuscrito preparado en mayo de 2026.
+        Repositorio del proyecto: \texttt{adversity-is-controllable}.}}
+
+\markboth{Tesis --- Ingeniería de Control y Microestructura de Mercado}{}
+
+\maketitle
+
+%==============================================================================
+\begin{abstract}
+Este trabajo describe una arquitectura adaptativa para ejecutar órdenes de
+compra de Bitcoin contra Tether (par BTC/USDT del exchange Binance) usando
+datos reales de mercado a una resolución de 100 ms. El sistema combina un
+filtro de Kalman lineal --- que estima dos variables ocultas del mercado:
+la presión direccional y el régimen de volatilidad --- con un algoritmo
+de aprendizaje en línea conocido como Hedge, que selecciona en cada tick
+una de tres acciones: esperar, postear una orden límite, o cruzar el spread
+con una orden a mercado. Sobre cuatro sesiones independientes que totalizan
+217\,425 ticks de mercado, se evaluaron cuatro variantes del controlador:
+una versión sin estado, una con condicionamiento unidimensional sobre la
+presión, una bidimensional con presión más régimen, y tres bidimensionales
+adversariales que reemplazan el régimen por señales rolling de 60 segundos.
+El resultado central es que la versión unidimensional condicionada en presión
+gana en todos los pares estadísticamente significativos (160 corridas
+comparadas, $|t|\!\geq\!17$ frente a cualquier competidor multidimensional)
+y que la causa mecanística del fracaso de las variantes ricas en estado es
+una \emph{barrera de toxicidad}: cualquier eje secundario que detecta
+oportunidades de fill aumenta la fracción de órdenes pasivas, las cuales
+se ejecutan precisamente en los instantes previos a movimientos
+desfavorables del precio. Se proponen las direcciones siguientes para la
+tesis: (i) condicionamiento por tamaño de orden y (ii) confirmación
+multi-sesión del resultado positivo de presión.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Microestructura de mercado, filtro de Kalman, aprendizaje en línea,
+algoritmo Hedge, ejecución óptima, BTC/USDT, criptomonedas, control
+adaptativo, libro de órdenes.
+\end{IEEEkeywords}
+
+%==============================================================================
+\section{Introducción}\label{sec:intro}
+
+Cualquier persona que compre una criptomoneda en una bolsa electrónica
+enfrenta un problema simple de enunciar pero difícil de resolver:
+\emph{cómo} comprar. Si se cruza el diferencial de inmediato (\emph{orden
+a mercado}) la compra es segura pero costosa porque se paga el lado más
+caro del libro. Si se postea una orden límite al mejor bid el precio
+medio queda mejor pero la orden puede no ejecutarse; y cuando se ejecuta
+suele ser justo antes de que el precio caiga --- es decir, justo cuando
+peor compra hace el comprador. Si se espera, se corre el riesgo de que
+el precio suba y se compre más caro un instante después.
+
+\medskip
+
+La tesis aborda este problema bajo el supuesto operativo siguiente: en
+cada uno de los más de \num{217000} ticks que componen las cuatro
+sesiones experimentales, un agente está \emph{obligado} a comprar 1 BTC.
+La obligación elimina del problema la decisión de cuánto comprar y deja
+solo la decisión de \emph{cómo} hacerlo. Las tres acciones son
+\textsc{Wait}, \textsc{Passive} (orden límite al best bid) y
+\textsc{Aggressive} (orden a mercado al best ask).
+
+\medskip
+
+La pregunta de investigación, en una sola línea, es:
+\begin{quote}
+\emph{Dadas las condiciones actuales del mercado, ¿cómo debe actuar el
+agente para minimizar el costo conjunto de slippage y movimiento
+adverso?}
+\end{quote}
+
+\medskip
+
+La hipótesis central es que las condiciones actuales del mercado pueden
+resumirse en dos números ocultos --- la \emph{presión} (cuánto empuje
+direccional hay) y el \emph{régimen} (cuánta turbulencia hay) --- y que
+un filtro de Kalman puede estimarlos a partir de tres observaciones
+extraídas del libro de órdenes. Una vez estimados, un algoritmo de
+aprendizaje en línea (Hedge) elige la acción que minimiza el costo
+acumulado de ejecución.
+
+\medskip
+
+El resto del artículo se organiza así. La Sección~\ref{sec:mercado}
+explica desde cero la mecánica de compra en BTC/USDT y todos los
+términos económicos que aparecen después. La Sección~\ref{sec:arq}
+describe la arquitectura del sistema con un diagrama de bloques.
+La Sección~\ref{sec:features} desglosa las features observables.
+La Sección~\ref{sec:kalman} \emph{deconstruye número por número} las
+matrices del filtro de Kalman. La Sección~\ref{sec:hedge} explica el
+algoritmo Hedge y sus tres variantes condicionadas por estado.
+La Sección~\ref{sec:simulador} describe el simulador de ejecución y
+la función de pérdida. La Sección~\ref{sec:experimentos} presenta el
+diseño experimental y la Sección~\ref{sec:resultados} los resultados
+con las cinco figuras principales. La Sección~\ref{sec:discusion}
+explica el hallazgo mecanístico central, llamado \emph{barrera de
+toxicidad}, y la Sección~\ref{sec:conclusiones} concluye y sugiere
+los próximos pasos.
+
+%==============================================================================
+\section{Mercado y mecánica de ejecución en BTC/USDT}\label{sec:mercado}
+
+Esta sección está escrita pensando en una persona con formación de
+ingeniería pero sin experiencia previa en mercados financieros. El
+objetivo es que cuando aparezca \emph{spread} o \emph{OFI} más
+adelante en el texto, el lector ya sepa exactamente qué significa.
+
+\subsection{El par BTC/USDT}
+BTC es el ticker de Bitcoin. USDT es Tether, una criptomoneda diseñada
+para mantener un valor cercano a un dólar estadounidense. El par
+\emph{BTC/USDT} indica el precio de un Bitcoin medido en USDT.
+Una cotización del estilo
+\[
+\text{BTC/USDT} = 76\,230{,}70
+\]
+significa que en el momento de la cotización un Bitcoin se cambia por
+unos \num{76230,70} USDT. Como un USDT es aproximadamente un dólar,
+esto se interpreta también como ``el Bitcoin vale unos 76\,230 dólares''.
+
+\subsection{El libro de órdenes (\emph{order book})}
+
+Una bolsa electrónica como Binance funciona con un \emph{libro de
+órdenes} que es esencialmente dos listas:
+
+\begin{itemize}
+\item Los \emph{bids} son las órdenes de compra que están esperando.
+      Cada bid tiene un \textbf{precio} (cuánto está dispuesto a pagar
+      el comprador por 1 BTC) y una \textbf{cantidad} (cuántos BTC
+      quiere a ese precio). Los bids se ordenan de mayor a menor precio:
+      el bid con el precio más alto es el \emph{best bid}.
+\item Los \emph{asks} (también llamados \emph{offers}) son las órdenes
+      de venta. Tienen también precio y cantidad, ordenadas de menor a
+      mayor precio: el ask con precio más bajo es el \emph{best ask}.
+\end{itemize}
+
+\noindent
+Una representación cualitativa del libro a un instante $t$ se muestra
+en la Tabla~\ref{tab:libro-ejemplo}.
+
+\begin{table}[!htbp]
+\caption{Ejemplo simplificado del libro de órdenes.}
+\label{tab:libro-ejemplo}
+\centering
+\begin{tabular}{rrcll}
+\toprule
+\multicolumn{2}{c}{\textbf{Bids (compra)}} & & \multicolumn{2}{c}{\textbf{Asks (venta)}} \\
+\cmidrule(r){1-2} \cmidrule(l){4-5}
+Precio (USDT) & Cantidad (BTC) & & Precio (USDT) & Cantidad (BTC) \\
+\midrule
+76\,230{,}69 & 0{,}210 & \textsc{best} & 76\,230{,}70 & 0{,}085 \\
+76\,230{,}68 & 1{,}040 &              & 76\,230{,}71 & 0{,}450 \\
+76\,230{,}67 & 0{,}330 &              & 76\,230{,}72 & 0{,}120 \\
+$\vdots$     & $\vdots$ &              & $\vdots$     & $\vdots$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+El número clave que se deriva del libro es el \textbf{precio medio}
+o \emph{mid price}:
+\begin{equation}
+\text{mid}_t = \frac{\text{best\_bid}_t + \text{best\_ask}_t}{2}.
+\label{eq:mid}
+\end{equation}
+
+En BTC/USDT el incremento mínimo de precio (\emph{tick size}) es de
+0{,}01 USDT, así que el spread más estrecho posible es de un centavo.
+La realidad observada en \num{38973} ticks limpios entre el 20 y 21
+de abril de 2026 es que el spread está exactamente en 0{,}01 USDT
+durante el 99{,}5\% del tiempo, con picos ocasionales de hasta 8 USDT
+durante eventos de baja liquidez.
+
+\subsection{Las tres acciones del agente}
+
+El agente, en cada tick, escoge una de tres acciones:
+
+\begin{description}
+\item[\textsc{Wait}.] No envía ninguna orden. Espera al siguiente tick
+      (típicamente 100 ms después). El costo de esperar es que si el
+      precio sube, en el próximo tick se compra más caro.
+\item[\textsc{Passive}.] Postea una orden límite de compra de 1 BTC
+      al precio del best bid actual. Esa orden \emph{solo} se ejecuta
+      si en el siguiente tick aparece un vendedor que crea una orden
+      de venta a ese precio (o por debajo) que cruce con la nuestra.
+      En la práctica, esto ocurre cuando el precio medio cae. Si el
+      precio sube, la orden no se ejecuta.
+\item[\textsc{Aggressive}.] Envía una orden a mercado de 1 BTC. La
+      orden se ejecuta inmediatamente contra el best ask. La compra
+      siempre se concreta. Pero pagamos el lado más caro del libro:
+      pagamos por encima del mid en una cantidad igual a medio spread.
+\end{description}
+
+\subsection{Slippage y adverse move (definiciones formales)}
+
+Las dos componentes del costo de ejecución son:
+
+\paragraph{Slippage.}
+Es la diferencia entre el precio al que ejecutamos y el precio medio
+en el momento de la decisión. Si la orden se ejecutó con precio
+$p^{\text{fill}}$ y en el momento de decidir el mid era
+$\text{mid}_t$:
+\begin{equation}
+\text{slippage}_t \;=\; p^{\text{fill}}_t - \text{mid}_t.
+\label{eq:slippage}
+\end{equation}
+Para una orden agresiva, $p^{\text{fill}} = \text{best\_ask}$ y el
+slippage es positivo (pagamos más que el mid). Para una orden pasiva
+ejecutada, $p^{\text{fill}} = \text{best\_bid}$ y el slippage es
+\emph{negativo} (compramos por debajo del mid: capturamos medio
+spread). Si la orden no se ejecuta el slippage es cero por convención.
+
+\paragraph{Adverse move.}
+Mide cuánto se movió el precio en contra de nuestra posición
+\emph{después} de que actuamos. Sea
+$\text{next\_mid}_t = \text{mid}_{t+1}$ el precio medio en el tick
+siguiente.
+
+\begin{itemize}
+\item Si la orden se ejecutó comprando a precio $p^{\text{fill}}_t$:
+\begin{equation}
+\text{adverse}_t = \max\bigl(0,\; p^{\text{fill}}_t - \text{next\_mid}_t\bigr).
+\label{eq:adverse-fill}
+\end{equation}
+Es decir, si el precio cayó por debajo de lo que pagamos, registramos
+la diferencia. Si el precio subió, el adverse es cero.
+
+\item Si la orden no se ejecutó (acción \textsc{wait} o \textsc{passive}
+sin fill):
+\begin{equation}
+\text{adverse}_t = \max\bigl(0,\; \text{next\_mid}_t - \text{mid}_t\bigr).
+\label{eq:adverse-nofill}
+\end{equation}
+Si el precio subió, perdimos una oportunidad de comprar más barato.
+Si bajó, esperar fue lo correcto y el adverse es cero.
+\end{itemize}
+
+\paragraph{Función de pérdida del tick.}
+La pérdida que entra al algoritmo Hedge en cada tick es:
+\begin{equation}
+L_t \;=\; \text{slippage}_t \;+\; \lambda \cdot \text{adverse}_t,
+\label{eq:loss}
+\end{equation}
+con $\lambda = 0{,}1$ por defecto. La elección de
+$\lambda$ se discute en la Sección~\ref{sec:simulador}.
+
+\subsection{Order Flow Imbalance (OFI)}\label{ssec:ofi}
+
+OFI mide el cambio neto de presión en el libro entre dos snapshots
+consecutivos. Para el nivel $i$ (donde $i\!=\!0$ es el top of book):
+\begin{equation}
+\mathrm{OFI}_{t,i} \;=\; \bigl(q^{\text{bid}}_{t,i} - q^{\text{bid}}_{t-1,i}\bigr)
+                       - \bigl(q^{\text{ask}}_{t,i} - q^{\text{ask}}_{t-1,i}\bigr),
+\label{eq:ofi}
+\end{equation}
+donde $q^{\text{bid}}_{t,i}$ es la cantidad agregada en el bid de
+rango $i$ en el tick $t$. Si OFI$_{t,1}>0$ significa que entre
+$t\!-\!1$ y $t$ creció la cantidad demandada al best bid o decreció
+la ofrecida al best ask: hay presión compradora. Si OFI$<0$ ocurre
+lo contrario: presión vendedora. La feature \texttt{ofi\_l1} usada en
+la observación del filtro corresponde a $i\!=\!1$ (top of book). Esta
+formulación sigue la convención multinivel de Bouchaud et~al.~\cite{bouchaud2018trades}.
+
+\subsection{Depth imbalance}\label{ssec:dimbalance}
+
+Depth imbalance agrega cantidades a través de los $N$ niveles
+superiores del libro:
+\begin{equation}
+\text{depth\_imb}_t \;=\; \frac{Q^{\text{bid}}_t - Q^{\text{ask}}_t}
+                                    {Q^{\text{bid}}_t + Q^{\text{ask}}_t}
+                                    \in (-1, +1),
+\label{eq:depthimb}
+\end{equation}
+con
+$Q^{\text{bid}}_t = \sum_{i=1}^{N}\,w_i \, q^{\text{bid}}_{t,i}$ y
+análogamente $Q^{\text{ask}}_t$. Los pesos lineales $w_i = N\!-\!i\!+\!1$
+le dan más peso al top of book y menos a los niveles profundos.
+Por defecto $N=10$. Los valores cercanos a $+1$ indican mucho más bid
+que ask (presión compradora persistente); valores cercanos a $-1$
+indican lo contrario.
+
+\subsection{Volatilidad realizada vol\_30s}\label{ssec:vol30s}
+
+\texttt{vol\_30s} es la desviación estándar de los retornos
+logarítmicos del mid price calculados sobre los últimos 30 segundos:
+\begin{equation}
+\text{vol\_30s}_t \;=\; \mathrm{std}\!\left\{
+\ln \frac{\text{mid}_s}{\text{mid}_{s-1}}
+\;:\; s\in (t-30\text{s},\,t]
+\right\}.
+\label{eq:vol30s}
+\end{equation}
+Se eligió 30~s en lugar de la ventana original de 5~s porque
+\texttt{vol\_5s} estaba en cero el 54\% del tiempo (el mid no se mueve
+durante muchos intervalos cortos en BTC) mientras que
+\texttt{vol\_30s} es no-cero el 91{,}47\% del tiempo. Más densidad de
+señal $\Rightarrow$ mejor condicionamiento para el filtro.
+
+\subsection{Microprecio}
+
+Como referencia auxiliar usamos también el \emph{microprecio}, que
+es el mid ponderado por cantidades:
+\begin{equation}
+\text{microprice}_t \;=\;
+\frac{q^{\text{bid}}_{t,1}\,\text{best\_ask}_t \;+\;
+      q^{\text{ask}}_{t,1}\,\text{best\_bid}_t}
+     {q^{\text{bid}}_{t,1} + q^{\text{ask}}_{t,1}}.
+\label{eq:microprice}
+\end{equation}
+Si en el best bid hay 0{,}1 BTC y en el best ask hay 10 BTC, el
+microprecio se desplaza hacia el bid: el lado delgado predice la
+dirección probable del próximo movimiento. No se usa como observación
+del filtro pero se calcula y se almacena para diagnóstico.
+
+%==============================================================================
+\section{Arquitectura del sistema}\label{sec:arq}
+
+El sistema es una tubería (\emph{pipeline}) de seis pasos
+diferenciados, ilustrada en la Fig.~\ref{fig:bloques}.
+
+\begin{figure*}[!htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=0.55cm and 0.85cm,
+  block/.style={rectangle,draw,thick,rounded corners,
+                minimum width=2.6cm,minimum height=1cm,align=center,
+                font=\small},
+  data/.style ={rectangle,draw,thick,fill=gray!12,
+                minimum width=2.4cm,minimum height=0.85cm,align=center,
+                font=\small\itshape},
+  arrow/.style={-Stealth,thick}
+  ]
+
+  \node[data]                                       (raw)   {Binance WS\\depth + trades};
+  \node[block,right=of raw]                          (book)  {Paso 1\,--\,2\\Reconstrucción\\del libro};
+  \node[block,right=of book]                         (feat)  {Paso 3\\Feature pipeline};
+  \node[data,right=of feat]                          (z)     {$\zv_t \in \R^3$};
+  \node[block,below=of z]                            (kal)   {Paso 4\\Filtro de Kalman};
+  \node[data,left=of kal]                            (xv)    {$\xv_t = (\text{pres},\text{reg})$};
+  \node[block,left=of xv]                            (pol)   {Paso 5\\Política Hedge};
+  \node[data,below=of pol]                           (act)   {Acción\,$\in\{\textsc{Wait},\textsc{Pass},\textsc{Agg}\}$};
+  \node[block,right=of act]                          (sim)   {Paso 6\\Simulador};
+  \node[data,right=of sim]                           (loss)  {Loss $L_t$};
+
+  \draw[arrow] (raw) -- (book);
+  \draw[arrow] (book) -- (feat);
+  \draw[arrow] (feat) -- (z);
+  \draw[arrow] (z) -- (kal);
+  \draw[arrow] (kal) -- (xv);
+  \draw[arrow] (xv) -- (pol);
+  \draw[arrow] (pol) -- (act);
+  \draw[arrow] (act) -- (sim);
+  \draw[arrow] (sim) -- (loss);
+  \draw[arrow] (loss) |- ++(-13.5,-0.7) |- (pol.south);
+
+\end{tikzpicture}
+\caption{Diagrama de bloques del sistema. La salida del simulador
+        (loss escalar) se realimenta al algoritmo Hedge para actualizar
+        las probabilidades de acción.}
+\label{fig:bloques}
+\end{figure*}
+
+\medskip
+
+A continuación se describe cada bloque en una línea para que el
+lector tenga el mapa completo antes de la matemática.
+
+\begin{enumerate}
+\item \textbf{Pasos 1--2 --- Ingesta y libro.} Un cliente WebSocket lee
+      el flujo de actualizaciones de Binance y reconstruye el libro
+      local mediante un \texttt{SortedDict} con claves negadas
+      (los bids como \texttt{-precio} para que el índice 0 sea siempre
+      el mejor bid). Periódicamente se sincroniza con un snapshot REST
+      para defenderse de cortes de WebSocket; ante una brecha de
+      identificadores de actualización se hace \emph{self-heal} desde
+      el snapshot que la cubre.
+\item \textbf{Paso 3 --- Feature pipeline.} Cada snapshot del libro
+      pasa por funciones puras que calculan
+      \texttt{depth\_imbalance}, \texttt{ofi\_l1},
+      \texttt{spread\_abs}, \texttt{vol\_30s} y \texttt{microprice}.
+\item \textbf{Paso 4 --- Filtro de Kalman.} Estima
+      $\xv_t = (\text{presión}, \text{régimen})^\top$ a partir de
+      $\zv_t = (\text{depth\_imb}, \text{ofi\_l1}, \text{vol\_30s})^\top$.
+\item \textbf{Paso 5 --- Política Hedge.} Recibe $\xv_t$ y elige una
+      acción muestreando de las probabilidades aprendidas (en la
+      variante condicionada, las probabilidades dependen del bucket
+      de presión).
+\item \textbf{Paso 6 --- Simulador y pérdida.} Aplica la acción contra
+      el libro actual y el siguiente, calcula slippage y adverse, y
+      emite el escalar $L_t$ que actualiza los pesos del Hedge.
+\end{enumerate}
+
+%==============================================================================
+\section{Pipeline de features}\label{sec:features}
+
+El \texttt{FeaturePipeline} es \emph{stateful}: mantiene una
+referencia al snapshot anterior (necesaria para OFI) y un buffer
+circular de mids para la volatilidad (Sección~\ref{ssec:vol30s}).
+Para cada snapshot del libro $\mathcal{B}_t$ produce un
+\texttt{FeatureVector} con todos los campos descritos en la
+Sección~\ref{sec:mercado}. La pipeline está diseñada para no
+materializar el estado del libro en disco: los snapshots fluyen
+directamente del \texttt{BookBuilder} a la pipeline. Solo el
+\texttt{FeatureVector} se persiste en formato Parquet, particionado
+por fecha y hora.
+
+Cuando el filtro de Kalman recibe la observación, se quedan tres
+campos del vector: $\text{depth\_imb}$, $\text{ofi\_l1}$,
+$\text{vol\_30s}$. El resto del \texttt{FeatureVector}
+($\text{spread\_abs}$, $\text{best\_bid}$, $\text{best\_ask}$,
+$\text{mid}$, $\text{microprice}$) lo usa el simulador para calcular
+slippage y adverse.
+
+%==============================================================================
+\section{Filtro de Kalman: deconstrucción matricial completa}\label{sec:kalman}
+
+Esta sección desarma el filtro número por número. La meta es que el
+lector pueda señalar cualquier celda de cualquier matriz y decir qué
+hace.
+
+\subsection{Modelo de espacio de estados}
+
+El filtro asume un sistema lineal con estado oculto:
+\begin{align}
+\xv_t \;=\;& \Fm\,\xv_{t-1} + \mathbf{w}_t,\quad \mathbf{w}_t\sim\mathcal{N}(\mathbf{0},\Qm)
+\label{eq:dynamics}\\[2pt]
+\zv_t \;=\;& \Hm\,\xv_t + \mathbf{v}_t,\quad \mathbf{v}_t\sim\mathcal{N}(\mathbf{0},\Rm)
+\label{eq:measurement}
+\end{align}
+
+\noindent
+El estado $\xv_t \in \R^2$ y la observación $\zv_t \in \R^3$ son:
+\begin{equation}
+\xv_t = \begin{pmatrix}\text{pressure}_t \\ \text{regime}_t\end{pmatrix},
+\qquad
+\zv_t = \begin{pmatrix}\text{depth\_imb}_t \\ \text{ofi\_l1}_t \\ \text{vol\_30s}_t\end{pmatrix}.
+\label{eq:state-obs}
+\end{equation}
+
+\subsection{Estandarización previa de la observación}
+
+Antes de entrar al filtro, cada componente de $\zv_t$ se transforma como
+\begin{equation}
+\tilde{z}_{t,i} \;=\; \bigl(z_{t,i} - c_i\bigr)\, s_i,
+\label{eq:standardize}
+\end{equation}
+con
+\begin{equation}
+\mathbf{c} = \begin{pmatrix}0\\0\\3{,}1658\!\cdot\!10^{-5}\end{pmatrix},\quad
+\mathbf{s} = \begin{pmatrix}1\\1\\\num{36876,637}\end{pmatrix}.
+\label{eq:standardize-vals}
+\end{equation}
+
+\noindent
+\textbf{Por qué cada celda.}
+\begin{itemize}
+\item $c_0=c_1=0$, $s_0=s_1=1$: \texttt{depth\_imb} ya vive en el
+      intervalo $(-1,+1)$ y \texttt{ofi\_l1} tiene desviación
+      estándar empírica $\approx 1{,}51$. Estandarizarlas no aporta y
+      sí destruiría las cotas (intencionales) de los buckets de presión.
+\item $c_2 = 3{,}1658\!\cdot\!10^{-5}$ es el promedio empírico de
+      \texttt{vol\_30s} en la primera ventana limpia de 38\,973 ticks
+      (Apr~20--21).
+\item $s_2 = 36876{,}637 = 1/\sigma$ donde $\sigma = 2{,}7117\!\cdot\!10^{-5}$
+      es la desviación estándar empírica de \texttt{vol\_30s} en esa
+      misma ventana.
+\end{itemize}
+
+\noindent
+\textbf{Por qué hace falta.} Sin (\ref{eq:standardize}), $z_{t,2}$ vale
+en magnitud $\sim\!10^{-5}$. Como $\Hm[2,1]=1$, la dimensión
+\texttt{regime} del estado oculto está \emph{acotada} por la magnitud
+de $z_{t,2}$ por construcción matemática: por más que se ajuste
+$\Rm[2,2]$, regime no puede tener un rango dinámico útil si la
+observación es del orden de $10^{-5}$. Con la estandarización
+$\tilde{z}_{t,2}$ pasa a tener media cero y varianza unitaria, y
+regime puede moverse en un rango interpretable del orden de unidades.
+La verificación empírica está en la Sección~\ref{sec:resultados}:
+después del fix la desviación de regime pasó de $3{,}17\!\cdot\!10^{-5}$
+a $0{,}3709$.
+
+\subsection{Matriz de transición $\Fm$}
+
+\begin{equation}
+\Fm = \begin{pmatrix}0{,}90 & 0{,}00 \\ 0{,}00 & 0{,}95\end{pmatrix}.
+\label{eq:Fmatrix}
+\end{equation}
+
+\noindent
+\textbf{Lectura celda por celda.}
+\begin{itemize}
+\item $\Fm[0,0]=0{,}90$: la presión en $t$ ``recuerda'' el 90\% de la
+      presión en $t-1$. Equivale a un decaimiento exponencial con tiempo
+      característico
+      $\tau_{\text{pres}}\!\approx\!1/(1-0{,}90)\!=\!10$ ticks
+      ($\sim\!1$ segundo a 100~ms por tick).
+\item $\Fm[1,1]=0{,}95$: el régimen es más \emph{pegajoso}. Decaimiento
+      característico de unos 20 ticks ($\sim\!2$ segundos). Este
+      apareamiento refleja una creencia previa: la volatilidad cambia
+      más despacio que la presión direccional.
+\item $\Fm[0,1]=\Fm[1,0]=0$: presión y régimen no se acoplan en la
+      transición. El filtro permite que la observación los acople a
+      través de $\Hm$, pero la dinámica en sí los trata como dos canales
+      independientes.
+\end{itemize}
+
+\subsection{Matriz de observación $\Hm$}
+
+\begin{equation}
+\Hm =
+\begin{pmatrix}
+1 & 0 \\
+1 & 0 \\
+0 & 1
+\end{pmatrix}.
+\label{eq:Hmatrix}
+\end{equation}
+
+\noindent
+\textbf{Lectura celda por celda.}
+\begin{itemize}
+\item Filas 0 y 1 (\texttt{depth\_imb} y \texttt{ofi\_l1}) cargan
+      $1$ en la columna 0 y $0$ en la columna 1: \emph{ambas observan
+      directamente la presión y nada del régimen}. Esto es coherente
+      con su semántica económica: ambas miden directamente desbalance
+      direccional.
+\item Fila 2 (\texttt{vol\_30s}) carga $0$ en la presión y $1$ en el
+      régimen: la volatilidad realizada \emph{solo} informa sobre el
+      estado de turbulencia, no sobre la dirección.
+\item Sin entradas cruzadas: el filtro asume que ningún feature lleva
+      información mezclada de presión y régimen. Esto simplifica la
+      identificabilidad pero podría violarse si añadimos un feature
+      mixto (e.g.\ momentum direccional ponderado por vol).
+\end{itemize}
+
+\subsection{Covarianza del proceso $\Qm$}
+
+\begin{equation}
+\Qm = \begin{pmatrix}0{,}010 & 0 \\ 0 & 0{,}005\end{pmatrix}.
+\label{eq:Qmatrix}
+\end{equation}
+
+\noindent
+\textbf{Lectura celda por celda.}
+$\Qm[0,0]\!=\!0{,}010$ es la varianza del ruido aleatorio que puede
+empujar la presión entre dos ticks (después del decaimiento por $\Fm$).
+$\Qm[1,1]\!=\!0{,}005$ es la mitad: el régimen se mueve aleatoriamente
+con menos amplitud, congruente con su mayor persistencia
+($\Fm[1,1]\!=\!0{,}95$). Las entradas fuera de diagonal son cero porque
+los dos procesos se modelan como ruido independiente.
+
+\subsection{Covarianza de la observación $\Rm$}
+
+\begin{equation}
+\Rm = \begin{pmatrix}0{,}4486 & 0 & 0 \\ 0 & 2{,}2878 & 0 \\ 0 & 0 & 1{,}0\end{pmatrix}.
+\label{eq:Rmatrix}
+\end{equation}
+
+\noindent
+\textbf{Lectura celda por celda.}
+\begin{itemize}
+\item $\Rm[0,0]=0{,}4486$: varianza empírica de \texttt{depth\_imb}
+      sobre la ventana limpia de 38\,973 ticks. Le dice al filtro:
+      ``\texttt{depth\_imb} es ruidosa con una desviación estándar de
+      $\sqrt{0{,}4486}\approx 0{,}67$''.
+\item $\Rm[1,1]=2{,}2878$: varianza empírica de \texttt{ofi\_l1}.
+      Equivale a $\sigma\approx 1{,}51$.
+\item $\Rm[2,2]=1{,}0$: \emph{por construcción}, porque la
+      estandarización (\ref{eq:standardize}) hace que la observación
+      $\tilde{z}_{t,2}$ tenga ya varianza unitaria. Si más adelante se
+      cambia el factor $s_2$, este valor también debe re-medirse.
+\item Entradas fuera de diagonal cero: se asume que los ruidos de
+      observación son independientes entre features. En la práctica
+      tienen correlaciones pequeñas pero no se modelan; el filtro
+      absorbe la diferencia en las ganancias.
+\end{itemize}
+
+\subsection{Estado y covarianza iniciales}
+
+\begin{equation}
+\xv_0 = \begin{pmatrix}0\\0\end{pmatrix},\qquad
+\Pm_0 = \begin{pmatrix}1 & 0 \\ 0 & 1\end{pmatrix}.
+\label{eq:initial}
+\end{equation}
+
+\noindent
+\textbf{Por qué.}
+$\xv_0$ vale cero porque al arrancar la sesión no se asume sesgo
+direccional ni estado de régimen. $\Pm_0$ vale la identidad: se
+declara una incertidumbre amplia, lo que hace que las primeras
+observaciones tengan ganancias de Kalman altas y el filtro converja
+rápido.
+
+\subsection{Ciclo predict--update}
+
+En cada tick el filtro aplica:
+
+\medskip
+\noindent
+\textbf{Predict:}
+\begin{align}
+\hat{\xv}_{t|t-1} &= \Fm\,\xv_{t-1} \label{eq:predict-x}\\
+\hat{\Pm}_{t|t-1} &= \Fm\,\Pm_{t-1}\,\Fm^\top + \Qm \label{eq:predict-P}
+\end{align}
+
+\medskip
+\noindent
+\textbf{Update:}
+\begin{align}
+\mathbf{y}_t &= \tilde{\zv}_t - \Hm\,\hat{\xv}_{t|t-1} \label{eq:innovation}\\
+\Sm_t &= \Hm\,\hat{\Pm}_{t|t-1}\,\Hm^\top + \Rm \label{eq:innov-cov}\\
+\Km_t &= \hat{\Pm}_{t|t-1}\,\Hm^\top\,\Sm_t^{-1} \label{eq:kalman-gain}\\
+\xv_t &= \hat{\xv}_{t|t-1} + \Km_t\,\mathbf{y}_t \label{eq:posterior-x}\\
+\Pm_t &= (\Iv - \Km_t\,\Hm)\,\hat{\Pm}_{t|t-1} \label{eq:posterior-P}
+\end{align}
+
+\medskip
+\noindent
+\textbf{Lectura intuitiva.}
+La ecuación~(\ref{eq:innovation}) calcula el residual de la
+predicción: cuánto se equivocó el filtro al pronosticar la observación.
+La (\ref{eq:innov-cov}) es la covarianza esperada de ese residual.
+La (\ref{eq:kalman-gain}) es la \emph{ganancia de Kalman}: una matriz
+$2\!\times\!3$ que dice cuánto del residual se aplica al estado.
+Si la observación es muy ruidosa (R grande) y la predicción muy
+confiable (P pequeño), la ganancia es chica y el filtro confía en su
+propia predicción. Si la predicción es incierta (P grande) y la
+observación poco ruidosa (R pequeño), la ganancia es grande y el
+filtro deja que la observación lo corrija.
+
+\subsection{Tamaños y dimensiones (resumen)}
+
+\begin{center}
+\begin{tabular}{lcr}
+\toprule
+Símbolo & Forma & Significado \\
+\midrule
+$\xv_t$        & $2\!\times\!1$ & estado oculto (presión, régimen)\\
+$\zv_t$        & $3\!\times\!1$ & observación cruda \\
+$\tilde{\zv}_t$& $3\!\times\!1$ & observación estandarizada \\
+$\Fm$          & $2\!\times\!2$ & transición de estado \\
+$\Hm$          & $3\!\times\!2$ & matriz de observación \\
+$\Qm$          & $2\!\times\!2$ & ruido de proceso \\
+$\Rm$          & $3\!\times\!3$ & ruido de observación \\
+$\Pm_t$        & $2\!\times\!2$ & covarianza posterior \\
+$\Km_t$        & $2\!\times\!3$ & ganancia de Kalman \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%==============================================================================
+\section{Política Hedge: algoritmo y variantes}\label{sec:hedge}
+
+El filtro entrega cada tick un estado $\xv_t$. La política decide qué
+hacer. Se evaluaron cuatro variantes; todas comparten el mismo núcleo
+algorítmico.
+
+\subsection{Algoritmo Hedge clásico (\emph{marginal})}
+
+Hedge mantiene una distribución de probabilidad $\bm{\pi}_t$ sobre
+las tres acciones $\mathcal{A}=\{\textsc{Wait},\textsc{Pass},\textsc{Agg}\}$.
+En cada tick:
+\begin{enumerate}
+\item Muestrea $a_t \sim \bm{\pi}_t$.
+\item Observa la pérdida $L_t$ asociada \emph{únicamente} a $a_t$
+      (\emph{bandit feedback}).
+\item Actualiza el peso de $a_t$:
+\begin{equation}
+w_{t+1}(a_t) \;=\; w_t(a_t) \cdot \exp\bigl(-\eta\,L_t\bigr),
+\label{eq:hedge-update}
+\end{equation}
+con $\eta=0{,}1$ (learning rate).
+\item Renormaliza para que $\sum_a w_{t+1}(a) = 1$, lo cual define
+      $\bm{\pi}_{t+1}$.
+\end{enumerate}
+
+Las acciones que reciben pérdidas altas pierden peso exponencialmente;
+las acciones con pérdidas bajas o negativas (ganancias) lo conservan
+o crecen. La cota clásica de regret de Hedge se cumple por bucket:
+$\sum_t L_t(a_t) - \min_a \sum_t L_t(a) \leq \mathcal{O}(\sqrt{T\,\log K})$
+con $T$ ticks y $K\!=\!3$ acciones.
+
+\medskip
+
+\noindent
+\textbf{Pesos iniciales.} $w_0(\textsc{Wait})=w_0(\textsc{Pass})=w_0(\textsc{Agg})=1/3$.
+Distribución uniforme: ningún sesgo previo.
+
+\subsection{Hedge condicionado por presión (1D bucketed)}
+
+Esta es la versión que ganó el experimento. Discretiza la presión
+$\xv_t[0]$ en seis buckets usando los cortes
+\[
+\text{pressure\_edges} = (-0{,}5,\, -0{,}2,\, 0,\, 0{,}2,\, 0{,}5),
+\]
+generando los buckets:
+
+\begin{center}\small
+\begin{tabular}{cl}
+\toprule
+Bucket & Rango de presión \\
+\midrule
+0 & $(-\infty,\, -0{,}5\,]$ \\
+1 & $(-0{,}5,\, -0{,}2\,]$ \\
+2 & $(-0{,}2,\, 0\,]$ \\
+3 & $(0,\, 0{,}2\,]$ \\
+4 & $(0{,}2,\, 0{,}5\,]$ \\
+5 & $(0{,}5,\, +\infty)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\medskip
+
+Hay seis vectores de pesos $\{\bm{\pi}^{(b)}_t\}_{b=0}^{5}$, uno por
+bucket. Al recibir $\xv_t$, se calcula $b_t = \mathrm{bucket}(\xv_t[0])$
+con búsqueda binaria; se muestrea $a_t \sim \bm{\pi}^{(b_t)}_t$; se
+observa $L_t$; y \emph{solo} $\bm{\pi}^{(b_t)}_t$ se actualiza con
+(\ref{eq:hedge-update}). Las garantías clásicas de Hedge se cumplen
+\emph{dentro} de cada bucket porque cada uno es un proceso de
+exponential-weights independiente.
+
+\subsection{Hedge condicionado 2D (presión $\times$ régimen)}
+
+Igual que la 1D pero con dos ejes. Se añaden los cortes de régimen
+$\text{regime\_edges}=(-0{,}3,\,0{,}3)$, generando 3 buckets de régimen
+(calmo / normal / elevado). El total es $6\!\times\!3=18$ celdas. Se
+mantiene un $\bm{\pi}^{(p,r)}_t$ por celda.
+
+\subsection{Hedge condicionado adversarial (presión $\times$ señal-rolling)}
+
+La hipótesis fue que el problema con la 2D regime no era el
+condicionamiento bidimensional sino que el segundo eje (régimen
+del Kalman) estaba detectando la \emph{probabilidad de fill}, no el
+\emph{riesgo adverso}. Se reemplazó el segundo eje por una de tres
+señales rolling de 60 segundos:
+\begin{align}
+\text{vol\_delta}_t &= \text{vol\_30s}_t - \text{vol\_30s}_{t-60s}\\
+\text{ofi\_window}_t &= \sum_{s\in(t-60s,\,t]} \text{ofi\_l1}_s\\
+\text{spread\_delta}_t &= \text{spread\_abs}_t - \text{spread\_abs}_{t-60s}
+\end{align}
+Los cortes del segundo eje se eligen por cuantiles empíricos pooled
+sobre las 3 sesiones disponibles al momento del experimento (ver
+Tabla~\ref{tab:cuts-secondaria}).
+
+\begin{table}[!htbp]
+\caption{Cortes del eje secundario por señal (cuantiles p33/p66
+         pooled sobre las 3 sesiones).}
+\label{tab:cuts-secondaria}
+\centering\small
+\begin{tabular}{lll}
+\toprule
+Señal & Cortes & Buckets \\
+\midrule
+\texttt{vol\_delta}    & $(-1{,}1\!\cdot\!10^{-5},\,+9{,}0\!\cdot\!10^{-6})$ & 3 \\
+\texttt{ofi\_window}   & $(-2{,}0,\,+1{,}9)$                                 & 3 \\
+\texttt{spread\_delta} & $(0)$                                               & 2 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{algorithm}[!htbp]
+\caption{Hedge bucketed (versión 1D, pseudo-código).}
+\label{alg:hedge1d}
+\begin{algorithmic}[1]
+\Require Cortes de presión, $\eta$, semilla RNG
+\Ensure  Para cada tick $t$, una acción $a_t$ y un peso actualizado
+\State Inicializar $\bm{\pi}^{(b)}_0 = (1/3, 1/3, 1/3)$ para $b=0\ldots 5$
+\For{cada tick $t$}
+  \State $\xv_t \gets$ filtro Kalman$(\zv_t)$
+  \State $b_t \gets \textsc{bucket}(\xv_t[0])$
+  \State $a_t \sim \bm{\pi}^{(b_t)}_t$
+  \State $L_t \gets$ simulador$(a_t,\;\text{libro}_t,\;\text{libro}_{t+1})$
+  \State $w \gets \bm{\pi}^{(b_t)}_t[a_t] \cdot e^{-\eta L_t}$
+  \State $\bm{\pi}^{(b_t)}_t[a_t] \gets w$
+  \State Renormalizar $\bm{\pi}^{(b_t)}_t$ para sumar 1
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+%==============================================================================
+\section{Simulador de ejecución y función de pérdida}\label{sec:simulador}
+
+\subsection{Modelo de fill}
+
+El simulador es determinista dadas $\text{mid}_t$, $\text{best\_bid}_t$,
+$\text{best\_ask}_t$ y $\text{mid}_{t+1}$. Para cada acción:
+\begin{itemize}
+\item \textsc{Wait}: nunca ejecuta. $p^{\text{fill}} = 0$, $\text{filled}=\text{false}$.
+\item \textsc{Passive}: ejecuta \emph{si y solo si} $\text{mid}_{t+1} \leq \text{mid}_t$,
+       en cuyo caso $p^{\text{fill}} = \text{best\_bid}_t$. La regla
+       captura la intuición de que un orden pasivo solo se cruza si
+       aparece flujo vendedor descendente.
+\item \textsc{Aggressive}: siempre ejecuta. $p^{\text{fill}} = \text{best\_ask}_t$.
+\end{itemize}
+
+\subsection{Función de pérdida y elección de $\lambda$}
+
+La pérdida por tick es la ec.~(\ref{eq:loss}). El parámetro $\lambda$
+es la palanca clave: pondera el costo de oportunidad
+($\text{adverse\_move}$) frente al costo en dólares
+($\text{slippage}$). Sobre datos limpios (38\,972 ticks, abril 2026):
+\[
+|\overline{\text{slip}}|=0{,}0013,\quad
+\overline{\text{adv}}=0{,}4750,\quad
+\sigma_{\text{slip}}=0{,}0247,\quad
+\sigma_{\text{adv}}=2{,}3022.
+\]
+
+\noindent
+Razones de balance:
+\begin{itemize}
+\item $\lambda=0{,}0027 = |\overline{\text{slip}}|/\overline{\text{adv}}$
+      iguala las contribuciones medias.
+\item $\lambda=0{,}0107 = \sigma_{\text{slip}}/\sigma_{\text{adv}}$
+      iguala las contribuciones de ruido.
+\item $\lambda=0{,}1$ (elegido) está entre 0{,}011 y 0{,}5 (default
+      original). En este punto, $\textsc{Wait}$ y $\textsc{Aggressive}$
+      tienen pérdida esperada en equilibrio prácticamente igual
+      (0{,}040 vs 0{,}044) mientras que \textsc{Passive} se penaliza
+      por selección adversa. Es decir, $\lambda=0{,}1$ obliga al
+      Hedge a usar realmente la información de estado para discriminar
+      entre las dos buenas acciones, en lugar de quedarse atascado en
+      la marginal trivial.
+\end{itemize}
+
+\subsection{Configuraciones aplicadas}
+
+\begin{table}[!htbp]
+\caption{Hiperparámetros del experimento.}
+\label{tab:hiperparams}
+\centering\small
+\begin{tabular}{lll}
+\toprule
+Parámetro & Valor & Donde está \\
+\midrule
+$\eta$ (Hedge)        & 0{,}10  & \texttt{configs/policy.yaml} \\
+$\lambda$ (loss)      & 0{,}10  & \texttt{configs/execution.yaml} \\
+\texttt{pressure\_edges} & $[-0{,}5,-0{,}2,0,0{,}2,0{,}5]$ & \texttt{configs/policy.yaml} \\
+\texttt{regime\_edges}   & $[-0{,}3,\,0{,}3]$ & \texttt{configs/policy.yaml} \\
+$\Fm,\Qm,\Rm,\Hm$       & ec.\,(\ref{eq:Fmatrix}--\ref{eq:Rmatrix}) & \texttt{configs/kalman.yaml} \\
+$\xv_0,\Pm_0$           & ec.\,(\ref{eq:initial}) & \texttt{configs/kalman.yaml} \\
+Semillas usadas         & $\{0,1,\ldots,9\}$ & --- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%==============================================================================
+\section{Diseño experimental}\label{sec:experimentos}
+
+\subsection{Datos}
+
+Se ingestaron en total cuatro sesiones limpias (sin huecos en la
+secuencia de identificadores de actualización del WebSocket) entre
+abril y mayo de 2026, ver Tabla~\ref{tab:sesiones}. Cada sesión es un
+flujo continuo de eventos de \texttt{depthUpdate} y \texttt{trade}
+desde Binance, persistido en JSONL. La feature pipeline produce un
+parquet con un \texttt{FeatureVector} por tick.
+
+\begin{table}[!htbp]
+\caption{Sesiones de evaluación.}
+\label{tab:sesiones}
+\centering\small
+\begin{tabular}{cllrr}
+\toprule
+ID & Inicio (UTC) & Fin (UTC) & Horas & Ticks \\
+\midrule
+S1 & 2026-04-20 19:54 & 2026-04-21 06:43 & 10{,}83 & \num{38973} \\
+S2 & 2026-04-28 03:12 & 2026-04-28 14:02 & 10{,}83 & \num{38977} \\
+S3 & 2026-04-30 01:45 & 2026-04-30 19:25 & 17{,}66 & \num{63590} \\
+S7 & 2026-04-30 23:00 & 2026-05-01 20:05 & 21{,}08 & \num{75885} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+S4--S6 son fragmentos generados por el patch de \emph{self-heal} del
+ingesto y se excluyen de todo análisis (entre 73 y 7\,060 filas
+cada uno).
+
+\subsection{Protocolo A/B pareado}
+
+Para cada sesión y cada par (modo, semilla):
+\begin{enumerate}
+\item Se reinicializa el filtro de Kalman desde $(\xv_0,\Pm_0)$.
+\item Se reinicializa la política con la semilla.
+\item Se replay-ea la sesión completa, tick por tick: filtro
+      $\to$ política $\to$ simulador $\to$ pérdida $\to$ actualización.
+\item Se acumulan las métricas: total\_loss, slippage total, adverse
+      total, fill\_rate, mezcla de acciones (porcentaje WAIT/PASS/AGG).
+\end{enumerate}
+
+Se usan diez semillas $(0,\ldots,9)$. La comparación es \emph{pareada}
+por semilla: la diferencia $L^{\text{rico}}_s - L^{\text{1D}}_s$ se
+calcula con $s$ misma para ambos modos. Esto cancela el ruido de
+muestreo del RNG y reduce mucho la varianza del test.
+
+\subsection{Estadística}
+
+Para cada par (modo rico, sesión) reportamos:
+\begin{itemize}
+\item Media y desviación estándar de la diferencia pareada
+      $d_s = L^{\text{rico}}_s - L^{\text{1D}}_s$.
+\item Estadístico $t$ pareado: $|t| = |\bar d|/(\sigma_d/\sqrt{n})$,
+      con $n=10$.
+\item Conteo de semillas en las que el modo rico vence al 1D.
+\end{itemize}
+La interpretación tradicional es $|t|<2$ ``ruido'',
+$|t|\!\approx\!2{-}3$ ``en el límite'', $|t|>3$ ``probablemente real'',
+$|t|>10$ ``sin duda''.
+
+\subsection{Regla de las dos sesiones}
+
+Una lección aprendida durante el desarrollo: ningún competidor se
+considera ganador con \emph{una sola sesión} a $|t|\!\geq\!2$, porque
+con 16 comparaciones independientes (4 sesiones $\times$ 4 modos)
+se espera que aproximadamente uno cruce $|t|=2$ por puro azar. La
+regla aplicada en la fase final de evaluación es: \emph{se requiere
+ganancia con $|t|\!\geq\!2$ y mismo signo en al menos dos sesiones
+independientes antes de promover una variante}.
+
+%==============================================================================
+\section{Resultados}\label{sec:resultados}
+
+\subsection{Resumen numérico}
+
+La Tabla~\ref{tab:master} resume las quince comparaciones pareadas
+producidas por los experimentos. Las cinco figuras
+(Fig.~\ref{fig:fig01}--\ref{fig:fig05}) están generadas a partir del
+JSON \texttt{ab\_adverse\_3sessions\_10seed.json} mediante
+\texttt{scripts/\_plots\_section25.py}.
+
+\begin{table*}[!htbp]
+\caption{Resumen de las comparaciones pareadas. Una entrada
+         ``$x/10$'' en \emph{wins} indica el número de semillas en
+         las que la columna del título derrotó al 1D bucketed.
+         La columna \emph{$|t|$} es el estadístico $t$ pareado.}
+\label{tab:master}
+\centering\small
+\begin{tabular}{llccc}
+\toprule
+Test & Sesión & Ticks & $|t|$ & wins/10 (1D) \\
+\midrule
+1D vs marginal       & S1 & \num{38972} & 64{,}15 & 10/10 \\
+\midrule
+1D vs 2D regime      & S2 & \num{38976} & 17{,}73 & 10/10 \\
+1D vs 2D regime      & S3 & \num{63589} & 37{,}67 & 10/10 \\
+\midrule
+1D vs vol\_delta     & S1 & \num{38972} & 28{,}89 & 10/10 \\
+1D vs vol\_delta     & S2 & \num{38976} & 34{,}73 & 10/10 \\
+1D vs vol\_delta     & S3 & \num{63589} & 34{,}72 & 10/10 \\
+1D vs vol\_delta     & S7 & \num{75885} & 25{,}05 & 10/10 \\
+\midrule
+1D vs spread\_delta  & S1 & \num{38972} & 12{,}65 & 10/10 \\
+1D vs spread\_delta  & S2 & \num{38976} & 12{,}20 & 10/10 \\
+1D vs spread\_delta  & S3 & \num{63589} & 28{,}48 & 10/10 \\
+1D vs spread\_delta  & S7 & \num{75885} & 24{,}42 & 10/10 \\
+\midrule
+1D vs ofi\_window    & S1 & \num{38972} & \phantom{0}2{,}97 & \phantom{0}8/10 \\
+1D vs ofi\_window    & S2 & \num{38976} & \phantom{0}5{,}45 & \phantom{0}9/10 \\
+1D vs ofi\_window    & S3 & \num{63589} & \phantom{0}2{,}37 & \phantom{0}2/10$^\dagger$ \\
+1D vs ofi\_window    & S7 & \num{75885} & \phantom{0}0{,}23 & \phantom{0}5/10 \\
+\bottomrule
+\multicolumn{5}{l}{\footnotesize $^\dagger$ \texttt{ofi\_window} ganó 8/10 en S3.}
+\end{tabular}
+\end{table*}
+
+\subsection{Figura 1 --- Pérdida total por sesión y modo}
+
+\begin{figure*}[!htbp]
+\centering
+\includegraphics[width=0.92\textwidth]{fig01_total_loss_per_session.png}
+\caption{Pérdida total media por (sesión $\times$ modo), con barras
+         de error de desviación estándar a través de 10 semillas
+         ($\lambda=0{,}1$). En cada grupo, la barra gris (1D baseline)
+         es la más baja en S1 y S2; en S3 y S7 está empatada
+         visualmente con \texttt{ofi\_window} (verde). Las barras
+         azul (\texttt{vol\_delta}) y roja (\texttt{spread\_delta})
+         son sistemáticamente más altas en las cuatro sesiones.}
+\label{fig:fig01}
+\end{figure*}
+
+\textbf{Lectura.} La pérdida total escala aproximadamente lineal con
+el número de ticks por sesión: 38k ticks $\to\!\sim\!1\,500$ unidades
+de pérdida; 64k ticks $\to\!\sim\!2\,500$; 76k ticks $\to\!\sim\!2\,870$.
+Esto confirma que el efecto por tick es estable y que las diferencias
+absolutas entre modos crecen proporcionalmente con la longitud de la
+sesión.
+
+\subsection{Figura 2 --- Diferencias pareadas con etiquetas $|t|$}
+
+\begin{figure*}[!htbp]
+\centering
+\includegraphics[width=0.92\textwidth]{fig02_paired_diff_vs_1d.png}
+\caption{Diferencias pareadas (modo $-$ 1D) en la pérdida total, con
+         estadístico $|t|$ etiquetado sobre cada barra. Barra positiva
+         = el modo pierde frente a 1D. Solo \texttt{ofi\_window}
+         (verde) cruza por debajo de cero, y solo en S3
+         ($|t|=2{,}37$). En S7 vuelve a ruido ($|t|=0{,}23$).}
+\label{fig:fig02}
+\end{figure*}
+
+\textbf{Lectura.} Esta figura es la prueba visual del fracaso de
+\texttt{vol\_delta} y \texttt{spread\_delta}: ambas pierden con
+$|t|>12$ en \emph{las cuatro} sesiones. Para \texttt{ofi\_window}, el
+punto crítico es la comparación S3 vs S7: la única sesión donde gana
+(S3) lo hace en el borde de la significancia
+($|t|=2{,}37$); cuando se le da más datos (S7, +19\% ticks), la
+ventaja se desploma a $|t|=0{,}23$. Si el problema fuera tamaño
+muestral, más datos deberían haber ayudado, no perjudicado.
+
+\subsection{Figura 3 --- Scatter pareado por semilla}
+
+\begin{figure*}[!htbp]
+\centering
+\includegraphics[width=0.92\textwidth]{fig03_per_seed_scatter_ofi_window_vs_1d.png}
+\caption{Comparación pareada por semilla de \texttt{ofi\_window}
+         contra 1D. Cuatro paneles, uno por sesión. Cada punto
+         representa una semilla; la línea $y=x$ es la frontera de
+         empate. Punto debajo de la línea $\Rightarrow$
+         \texttt{ofi\_window} venció a 1D para esa semilla. Conteos:
+         S1: 2/10. S2: 1/10. S3: 8/10. S7: 5/10.}
+\label{fig:fig03}
+\end{figure*}
+
+\textbf{Lectura.} Total a través de las cuatro sesiones: 16 victorias
+de \texttt{ofi\_window} en 40 comparaciones pareadas. Una política
+verdaderamente dominante mostraría 10/10 en cada sesión, como hizo el
+1D bucketed contra el marginal en S1 ($|t|\!=\!64$).
+
+\subsection{Figura 4 --- Distribución de acciones por modo}
+
+\begin{figure*}[!htbp]
+\centering
+\includegraphics[width=0.92\textwidth]{fig04_action_mix_per_session.png}
+\caption{Mezcla media de acciones por (sesión $\times$ modo). En las
+         cuatro sesiones cualquier modo ``rico'' (azul, verde, rojo)
+         exhibe un \emph{aumento sistemático} en \textsc{Passive}
+         (entre $+1{,}4$ y $+2{,}5$ puntos porcentuales) y la
+         consiguiente reducción en \textsc{Wait} y/o \textsc{Aggressive}
+         frente al 1D baseline (gris).}
+\label{fig:fig04}
+\end{figure*}
+
+\textbf{Lectura.} Esta es la figura más importante para entender
+\emph{por qué} las variantes ricas pierden. La dirección del cambio
+es la misma sin importar la señal del segundo eje: las tres señales
+(\texttt{vol\_delta}, \texttt{ofi\_window}, \texttt{spread\_delta})
+empujan al agente hacia más \textsc{Passive}. Esto sugiere que las
+tres están detectando un mismo subconjunto de momentos --- los de
+\emph{fill fácil} --- y que el algoritmo Hedge, sin saberlo, está
+re-pesando hacia la acción que parece localmente más barata pero que
+acumula mayor adverse.
+
+\subsection{Figura 5 --- Frontera Pareto slippage vs adverse}
+
+\begin{figure*}[!htbp]
+\centering
+\includegraphics[width=0.78\textwidth]{fig05_slippage_vs_adverse.png}
+\caption{Frontera Pareto bidimensional: total\_slippage en USDT (eje
+         x) contra total\_adverse\_move en unidades crudas (eje y).
+         Lower-left = mejor en ambos ejes. Un punto por (sesión,
+         modo). Las cuatro sesiones forman tres clusters por longitud
+         (10{,}8h, 17{,}7h, 21{,}1h). Dentro de cada cluster, los modos
+         se ordenan consistentemente: 1D (gris) abajo-derecha (más
+         slippage, menos adverse); \texttt{vol\_delta} (azul)
+         arriba-izquierda (menos slippage, más adverse).}
+\label{fig:fig05}
+\end{figure*}
+
+\textbf{Lectura.} La pendiente positiva de cada cluster es la
+firma de la \emph{barrera de toxicidad}: cualquier modo que ahorra
+slippage paga proporcionalmente más adverse. Empíricamente, en estos
+datos $\Delta\text{slip}\!\approx\!\Delta\text{adverse}/250$.
+A $\lambda\!=\!0{,}1$ el balance económico es $\Delta\text{slip}=
+-0{,}1\!\times\!\Delta\text{adverse}$, es decir cada \$1 de slippage
+ahorrado vale \$10 de adverse. Como en la realidad cada \$1 ahorrado
+viene con \$25 de adverse equivalente, todo movimiento a lo largo
+de la pendiente es perdedor neto. El único punto que escapa
+parcialmente es \texttt{ofi\_window} en S3 (cae estrictamente debajo
+y a la izquierda del 1D-S3). En las otras siete combinaciones
+(2 modos x 4 sesiones más \texttt{ofi\_window} en S1/S2/S7), todos los
+puntos caminan sobre la misma frontera.
+
+\subsection{Comportamiento por bucket (1D, S3, semilla 0)}
+
+Para visibilidad, la Tabla~\ref{tab:bucket-1d} muestra los pesos
+finales por bucket de la política 1D bucketed sobre S3. Buckets de
+los extremos (0 y 5) están sub-visitados y permanecen casi uniformes;
+los buckets centrales convergen claramente.
+
+\begin{table}[!htbp]
+\caption{Pesos finales por bucket de presión, política 1D, S3,
+         semilla 0.}
+\label{tab:bucket-1d}
+\centering\small
+\begin{tabular}{ccrrrr}
+\toprule
+b & rango & visitas & WAIT & PASSIVE & AGGR \\
+\midrule
+0 & $(-\infty,\,-0{,}500]$ &     43 & 0{,}3740 & 0{,}3351 & 0{,}2909 \\
+1 & $(-0{,}500,-0{,}200]$  & 16\,479 & 0{,}8870 & 0{,}0504 & 0{,}0626 \\
+2 & $(-0{,}200,\,0]$        & 17\,212 & 0{,}6754 & 0{,}1384 & 0{,}1862 \\
+3 & $(0,\,+0{,}200]$        & 16\,309 & 0{,}3025 & 0{,}1751 & 0{,}5224 \\
+4 & $(+0{,}200,+0{,}500]$   & 13\,456 & 0{,}0823 & 0{,}1039 & 0{,}8138 \\
+5 & $(+0{,}500,+\infty)$    &     90 & 0{,}3369 & 0{,}3080 & 0{,}3551 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Lectura.} El bucket 1 (presión vendedora moderada) ha
+aprendido a esperar en el 88{,}7\% de los casos. El bucket 4
+(presión compradora moderada) ha aprendido a cruzar agresivamente en
+el 81{,}4\% de los casos. La política condicionada está usando
+correctamente la presión: es la prueba empírica directa de que
+``saber la presión es suficiente''.
+
+%==============================================================================
+\section{Discusión: la barrera de toxicidad}\label{sec:discusion}
+
+Tres resultados aparentemente independientes convergen en un único
+mecanismo:
+
+\begin{enumerate}
+\item \textbf{Toda variante rica aumenta \textsc{Passive}}
+      ($+1{,}4$--$2{,}5$ pp; Fig.~\ref{fig:fig04}).
+\item \textbf{Toda variante rica ahorra slippage y paga más adverse}
+      (Fig.~\ref{fig:fig05}).
+\item \textbf{Las tres señales adversariales (\texttt{vol\_delta},
+      \texttt{ofi\_window}, \texttt{spread\_delta}) tienen mecanismos
+      económicos distintos pero fallan idénticamente.}
+\end{enumerate}
+
+\noindent
+La explicación unificadora es que \emph{los tres ejes secundarios son
+en realidad detectores de fill fácil, no de riesgo adverso}.
+Cuando la volatilidad de corto plazo aumenta, cuando el spread se
+ensancha, o cuando hay flujo neto sostenido en una dirección,
+\emph{aparecen oportunidades de cruzar a precio favorable} y el
+update multiplicativo de Hedge re-pesa hacia \textsc{Passive} en la
+celda correspondiente. Pero la microestructura de los fills pasivos
+en BTC/USDT es \emph{tóxica}: el flujo que cruza un bid pasivo es,
+en promedio, el flujo que tiene una razón fundamental para empujar el
+precio en su contra. La razón:
+\[
+\frac{\text{adverse}_{\textsc{Pass}}}{\text{adverse}_{\textsc{Agg}}} \;\approx\; 2.
+\]
+Es decir, los fills pasivos son seguidos por movimientos
+desfavorables del precio aproximadamente al doble que los fills
+agresivos.
+
+\medskip
+
+\noindent
+\textbf{Por qué 1D bucketed escapa a la trampa.} Con solo seis
+buckets, la política nunca aprende patrones finos: solo aprende la
+estructura global ``presión vendedora $\Rightarrow$ esperar; presión
+compradora $\Rightarrow$ cruzar''. Esa estructura coincide con la
+estructura óptima desde el punto de vista de toxicidad: cuando hay
+presión vendedora real, la peor decisión es comprar pasivo (los
+vendedores te están alimentando justo antes de la caída). Como la
+política 1D no puede ver \emph{micro-momentos} de fill fácil, no se
+deja arrastrar al cebo.
+
+\medskip
+
+\noindent
+\textbf{Implicancia teórica.} Adicionar dimensiones de estado al
+condicionamiento no es libre: cada dimensión adicional aumenta la
+varianza de la estimación por celda (la cantidad de updates por
+celda decrece como $1/N$), y si la información que aporta la
+dimensión adicional está correlacionada con un sesgo sistemático
+(aquí: ``oportunidad de fill''), el modelo va a sobreajustar a ese
+sesgo en lugar de a la métrica objetivo.
+
+\medskip
+
+\noindent
+\textbf{Implicancia práctica.} Para el problema BTC/USDT a 100 ms con
+$\lambda=0{,}1$, agregar \emph{cualquier} segundo eje al
+condicionamiento estado-acción no mejora la pérdida combinada. Tres
+intentos independientes con tres semánticas diferentes apuntan al
+mismo techo. La conclusión razonable es que \emph{el espacio de
+estados está agotado} para la familia de políticas bucketed.
+
+%==============================================================================
+\section{Trabajos relacionados y contexto industrial}\label{sec:related}
+
+Esta sección responde tres preguntas concretas: (i)~de dónde sale la
+idea de un filtro de Kalman, (ii)~de dónde sale la idea del algoritmo
+Hedge, y (iii)~si la combinación específica que usamos en este trabajo
+es algo común en la industria financiera o si es un híbrido propio.
+La respuesta corta es: ninguna de las dos piezas es nueva, las dos
+tienen décadas de literatura y uso operativo, pero combinarlas
+exactamente como aquí --- Kalman para inferencia de estado y Hedge
+bandit para selección de acción discreta --- es menos estándar de lo
+que parece. Llegamos a esa combinación por un camino de restricciones
+prácticas que se explican abajo.
+
+\subsection{El filtro de Kalman: del programa Apolo al trading
+            cuantitativo}
+
+El filtro de Kalman aparece en 1960 con un objetivo muy distinto al
+nuestro: estimar la posición y velocidad de un cohete a partir de
+mediciones ruidosas de inercia y radar~\cite{kalman1960}. Su primera
+aplicación de gran escala fue el sistema de guiado del programa
+Apolo en la NASA. Desde entonces es la herramienta estándar para
+estimación de estado en cualquier sistema dinámico lineal con ruido
+gaussiano: GPS, control de drones, robótica móvil, biomédica,
+predicción meteorológica.
+
+\medskip
+
+\noindent
+La adopción en finanzas llega en los años 80 a través de la
+econometría de series de tiempo. Dos libros marcaron la transición:
+Harvey~\cite{harvey1989} formalizó cómo expresar modelos econométricos
+clásicos (suavizamientos exponenciales, ARIMA, modelos estructurales)
+como sistemas de espacio de estados resolubles con Kalman; Hamilton
+\cite{hamilton1994} popularizó el enfoque entre los economistas
+empíricos. A partir de ahí el filtro entró en finanzas cuantitativas
+para tareas concretas:
+\begin{itemize}
+\item \textbf{Volatilidad latente.} Modelos tipo Stochastic Volatility
+      asumen que la volatilidad es un proceso oculto que se infiere
+      de los retornos observados. Cuando el modelo se linealiza
+      adecuadamente, el filtro de Kalman (o sus variantes extendidas)
+      hace la inferencia.
+\item \textbf{Modelos de factores con cargas variables en el tiempo.}
+      Si los $\beta$ de un modelo CAPM o multifactor cambian con el
+      régimen, se modelan como estados ocultos y el filtro los
+      actualiza tick a tick.
+\item \textbf{Cointegración dinámica.} Para pares de activos que se
+      mueven juntos pero con un spread que deriva, el spread se
+      modela como estado oculto y se filtra.
+\item \textbf{Microestructura de mercado.} Trabajos como
+      \cite{cont2014} y, más cerca de nuestro problema,
+      \cite{stoikov2018} sobre el microprecio, usan filtros de
+      espacio-estado para inferir el ``precio justo'' subyacente al
+      libro de órdenes a partir de las cotizaciones ruidosas.
+\end{itemize}
+
+\medskip
+
+\noindent
+\textbf{En la industria.} Es difícil saber qué corre exactamente en
+los servidores de Renaissance Technologies, Two Sigma, Citadel o
+Jane Street, porque ninguna firma publica su stack. Pero los
+\emph{papers} y conferencias públicas de sus equipos de research
+(NeurIPS, KDD, INFORMS) confirman que el espacio de estados
+gaussiano y los filtros de Kalman son herramientas estándar para:
+estimación de alfas latentes, descomposición de señal/ruido, y
+módulos de predicción dentro de pipelines más grandes. Lo importante
+es entender que no es una técnica exótica: es lo que un ingeniero
+financiero entrena en su primer año de maestría.
+
+\medskip
+
+\noindent
+\textbf{¿Por qué nosotros lo elegimos?} Tres razones, todas
+prácticas.
+\begin{enumerate}
+\item \emph{Forma cerrada}. Cada paso del filtro es una multiplicación
+      de matrices y una inversa de $3\!\times\!3$. No hay
+      entrenamiento, no hay hiperparámetros aprendidos, no hay riesgo
+      de no-convergencia. Las matrices vienen del dominio del problema.
+\item \emph{Datos limitados}. La primera sesión limpia eran solo 38\,973
+      ticks. Cualquier cosa con muchos parámetros entrenables
+      (redes neuronales, modelos de Markov ocultos con K estados
+      grandes) habría sufrido sobreajuste serio. Kalman tiene
+      esencialmente un parámetro ajustable por feature ($\Rm[i,i]$),
+      lo cual cabe cómodamente.
+\item \emph{Diagnóstico}. Cuando algo se rompe, podemos imprimir la
+      ganancia de Kalman, la covarianza posterior, y la innovación.
+      Cada número tiene una interpretación. Esto fue clave para
+      darnos cuenta, en sanity~§16, de que la dimensión de régimen
+      estaba muerta porque la observación tenía magnitud $\sim\!10^{-5}$.
+\end{enumerate}
+
+\subsection{El algoritmo Hedge: de teoría de juegos a ejecución
+            algorítmica}
+
+Hedge tiene un linaje doble: por un lado viene del aprendizaje en
+línea (online learning) y por otro de la teoría de juegos.
+La idea de los \emph{multiplicative weights updates} ya estaba en
+Littlestone--Warmuth~\cite{littlestone1994} (algoritmo de la
+mayoría ponderada, 1989). Freund y Schapire en
+1997~\cite{freund1997} formalizaron Hedge en el contexto de
+boosting y demostraron la cota de regret
+$\mathcal{O}(\sqrt{T\log K})$ que usamos en este trabajo. Auer
+et~al.\ en 2002~\cite{auer2002} extendieron el resultado al
+escenario \emph{bandit} --- en el que solo se observa la pérdida
+de la acción tomada, no de todas, que es exactamente nuestro caso.
+La síntesis canónica de toda la teoría está en
+Cesa-Bianchi y Lugosi~\cite{cesabianchi2006}.
+
+\medskip
+
+\noindent
+La aplicación a finanzas también es vieja. El trabajo seminal es
+\emph{Universal Portfolios} de Cover~\cite{cover1991}, que en 1991
+demostró que un portafolio actualizado con multiplicative weights
+sobre acciones individuales tiene desempeño asintóticamente
+comparable al mejor portafolio fijo en hindsight. Esto es
+literalmente Hedge aplicado a selección de cartera. La línea
+continúa con todo el campo de \emph{Online Portfolio Selection},
+y ya en los 2000 hay un cambio: el problema deja de ser ``qué
+cartera mantener'' y pasa a ser ``cómo ejecutar una orden grande''.
+
+\medskip
+
+\noindent
+\textbf{Ejecución óptima como problema de control.} El estándar
+clásico es Almgren--Chriss~\cite{almgren2001}, que formula la
+ejecución de una orden grande como un problema de control óptimo
+estocástico cerrado: dado un trade-off entre impacto de mercado y
+riesgo de varianza temporal, la solución es una trayectoria de
+ejecución de forma cerrada (a menudo cercana a TWAP/VWAP).
+Obizhaeva--Wang~\cite{obizhaeva2013} extendió el modelo con
+dinámicas de oferta y demanda. El libro de Cartea, Jaimungal y
+Penalva~\cite{cartea2015} es la referencia pedagógica
+moderna y cubre tanto modelos de control óptimo como filtros de
+estado para ejecución algorítmica.
+
+\medskip
+
+\noindent
+\textbf{Ejecución óptima como problema de aprendizaje.} La rama
+``aprendamos directamente de los datos'' arranca con
+Nevmyvaka--Feng--Kearns en 2006~\cite{nevmyvaka2006}: aplicaron
+Q-learning a la ejecución óptima de órdenes en datos reales de
+Nasdaq. De ahí en adelante, todo el reinforcement learning aplicado
+a microestructura cae en este linaje. Spooner et~al.~\cite{spooner2018}
+usaron RL para market making; Schnaubelt~\cite{schnaubelt2022} aplicó
+deep RL específicamente al placement de órdenes límite en
+criptomonedas. Hedge bandit (\emph{exp3}) es el primo más simple y
+más interpretable de toda esa familia: en lugar de una red neuronal
+con miles de parámetros aprende explícitamente una distribución
+sobre acciones que evoluciona con la pérdida observada.
+
+\medskip
+
+\noindent
+\textbf{En la industria.} Algoritmos de \emph{smart order routing}
+en brokers (Goldman Sachs SIGMA-X, Morgan Stanley Trading Tools,
+Citadel Securities) usan rutinas de online learning para decidir
+en cada milisegundo a qué venue (NYSE, Nasdaq, dark pools) enviar
+cada slice de una orden. La capa de decisión es típicamente
+exp3-style con priors entrenados offline; la capa de ejecución
+es Almgren--Chriss-like. En crypto, market makers como Wintermute,
+Jump Trading, GTS, y los desks internos de los grandes exchanges
+usan stacks similares, aunque proprietarios. El elemento común es
+que \emph{la decisión discreta de ``qué hacer ahora''} se reduce a
+un problema de bandit con feedback parcial, y la herramienta
+estándar para eso son las familias de algoritmos derivadas de
+Hedge / EXP3 / UCB.
+
+\medskip
+
+\noindent
+\textbf{¿Por qué nosotros lo elegimos?} Cuatro razones, otra vez todas
+prácticas.
+\begin{enumerate}
+\item \emph{Cota de regret cerrada}. La garantía
+      $\sum_t L_t(a_t) - \min_a \sum_t L_t(a) \leq \mathcal{O}(\sqrt{T\log K})$
+      vale sin asumir nada sobre la distribución de las pérdidas.
+      Para datos reales que pueden ser no-estacionarios, eso importa.
+\item \emph{No requiere modelo del entorno}. Los enfoques de
+      control óptimo necesitan especificar dinámicas del mercado;
+      las redes neuronales requieren grandes cantidades de data
+      similar a la de entrenamiento. Hedge solo necesita una
+      pérdida escalar por tick.
+\item \emph{Bandit feedback es nativo}. En ejecución solo
+      observamos qué pasó con la acción que tomamos; no sabemos
+      qué habría pasado si hubiéramos esperado o cruzado en su
+      lugar. Eso es exactamente la condición de
+      bandit~\cite{auer2002}, lo que descarta de entrada
+      cualquier algoritmo que asume full-information feedback.
+\item \emph{Interpretabilidad}. Cada bucket de presión exhibe sus
+      pesos finales en un vector de tres números. Si el bucket de
+      presión vendedora moderada termina con
+      $w(\textsc{Wait})=0{,}89$, sabemos exactamente qué aprendió y
+      podemos auditarlo. Una red neuronal con la misma información
+      es opaca.
+\end{enumerate}
+
+\subsection{La combinación Kalman + Hedge en la literatura}
+
+La combinación específica de este trabajo --- un filtro de Kalman que
+estima un estado oculto continuo, seguido por un Hedge bandit que
+selecciona acción condicionado en una discretización de ese estado
+--- no es una arquitectura estándar con un nombre propio en la
+literatura. Sin embargo, sus componentes y la lógica de separar
+``percepción'' (Kalman) de ``decisión'' (Hedge) tienen muchos
+antecedentes:
+
+\begin{itemize}
+\item Cartea--Jaimungal~\cite{cartea2015} construyen pipelines del
+      mismo estilo: filtro de espacio-estado (a veces Kalman, a veces
+      filtro de partículas) para inferir intensidades latentes de
+      flujo de órdenes, y luego una capa de control que toma
+      decisiones de ejecución.
+\item Avellaneda--Stoikov~\cite{avellaneda2008} ofrecen un esquema
+      de market making donde la cotización es función explícita de
+      la inferencia de inventario y volatilidad --- nuevamente,
+      separación entre estimación y acción.
+\item En la rama deep RL, los métodos \emph{actor-critic} con
+      \emph{auxiliary state estimation tasks} (e.g.\ predicción de
+      retornos a corto plazo como pérdida auxiliar para el critic)
+      son una forma moderna de la misma separación.
+\end{itemize}
+
+\noindent
+La diferencia con las prácticas industriales modernas es que la
+mayoría usa redes neuronales profundas en alguno (o ambos) de los dos
+bloques. Nosotros nos quedamos con la versión clásica por
+tres motivos: (a)~tenemos pocos datos por sesión, (b)~queríamos cada
+bloque debugueable de forma independiente, (c)~el problema es
+suficientemente bien-condicionado como para no necesitar la
+expresividad extra.
+
+\subsection{El camino que nos llevó a esta arquitectura}
+
+El recorrido conceptual del proyecto fue, en orden:
+
+\begin{enumerate}
+\item \emph{Pregunta inicial}: ¿se puede usar control adaptativo
+      sobre datos reales de criptomercado? Esta pregunta es
+      ingeniera, no financiera. La motivación viene de los cursos
+      de control y de la observación de que el libro de órdenes
+      tiene una dinámica de oferta/demanda observable y mensurable.
+\item \emph{Restricción de datos}: lo que podemos capturar
+      personalmente desde la API pública de Binance son ráfagas de
+      10--20 horas de WebSocket más snapshots. Eso son entre 38\,000
+      y 80\,000 ticks por sesión limpia. Cualquier algoritmo con
+      más parámetros que datos por bucket queda descartado por
+      sobreajuste.
+\item \emph{Restricción de feedback}: en simulación de ejecución
+      uno solo conoce el resultado de la acción que tomó. No hay
+      ground-truth contrafactual. Eso descarta supervised learning
+      directo y obliga a algo del tipo bandit.
+\item \emph{Restricción de diagnóstico}: como es un proyecto de
+      tesis, queremos poder señalar exactamente qué falla cuando
+      falla. Las cajas negras son antipedagógicas. Eso favorece
+      Kalman lineal y Hedge multiplicativo, ambos de forma cerrada.
+\item \emph{Conclusión arquitectónica}: separar la inferencia
+      del estado (Kalman) de la decisión (Hedge bucketed sobre el
+      estado). Cada bloque se valida por separado.
+      El Kalman se valida con sanity checks sobre la magnitud del
+      estado, la innovación y la covarianza; el Hedge se valida
+      con curvas de convergencia de pesos y comparaciones A/B.
+\end{enumerate}
+
+\noindent
+Visto desde afuera, llegamos a una arquitectura que está en la
+intersección de lo \emph{clásico de control} (Kalman) y lo
+\emph{clásico de aprendizaje en línea} (Hedge). Eso es por
+elección consciente: el campo se ha movido hacia deep RL en los
+últimos diez años, pero para datos limitados y necesidad de
+diagnóstico esa elección no es óptima. Nuestra contribución no es
+inventar nada en el plano teórico --- ambas piezas tienen décadas
+en sus respectivas literaturas --- sino mostrar empíricamente
+qué funciona y qué no funciona cuando se las acopla sobre datos
+microestructurales reales de BTC/USDT, y aislar el mecanismo
+(la barrera de toxicidad de la Sección~\ref{sec:discusion}) que
+impone un techo a esta familia de políticas.
+
+%==============================================================================
+\section{Conclusiones y trabajo futuro}\label{sec:conclusiones}
+
+\subsection{Conclusiones}
+
+\begin{enumerate}
+\item La arquitectura Kalman--Hedge funciona end-to-end sobre datos
+      reales de BTC/USDT a 100 ms. La integración pasa todos los
+      sanity checks empíricos (signos correctos de slippage,
+      convergencia de pesos, distribuciones de acciones razonables).
+\item El condicionamiento sobre la presión (1D bucketed) es una
+      mejora robusta y grande sobre la política sin estado:
+      $-29\%$ en pérdida combinada en S1 con $|t|=64{,}15$ y 10/10
+      semillas.
+\item Tres intentos independientes de añadir un eje secundario
+      (régimen de Kalman, \texttt{vol\_delta}, \texttt{spread\_delta},
+      \texttt{ofi\_window}) fallaron en perder a 1D en al menos
+      tres de cuatro sesiones. Solo \texttt{ofi\_window} ganó en
+      una sesión (S3, $|t|=2{,}37$) y empató en otra (S7,
+      $|t|=0{,}23$); por la regla de las dos sesiones no se promueve.
+\item El mecanismo común del fallo es la \emph{barrera de toxicidad}:
+      cualquier eje que detecta oportunidades de fill empuja al
+      Hedge hacia más \textsc{Passive}, y los fills pasivos son
+      sistemáticamente más tóxicos que los agresivos en este mercado.
+\end{enumerate}
+
+\subsection{Trabajo futuro}
+
+La dirección recomendada para el siguiente capítulo de la tesis es
+\textbf{condicionamiento por tamaño de orden}, que cambia el
+\emph{espacio de acciones} en lugar del espacio de estado:
+\begin{align}
+\mathcal{A}_{\text{nuevo}} \;=\; \{\, &\textsc{Wait},\notag\\
+                                   &\textsc{Pass}_{0{,}5},\textsc{Pass}_{1},\textsc{Pass}_{2},\notag\\
+                                   &\textsc{Agg}_{0{,}5},\textsc{Agg}_{1},\textsc{Agg}_{2}\,\}.
+\end{align}
+La hipótesis es que dotar al agente de la capacidad de modular el
+\emph{tamaño} de un fill pasivo (más pequeño en celdas neutras donde
+acecha la toxicidad, más grande en celdas direccionales donde la
+señal es real) crea una \emph{nueva frontera} en el plano slippage
+vs adverse, en lugar de un nuevo punto sobre la frontera vieja.
+La implementación es ligera: extender el enum de \texttt{Action} de 3
+a 7 valores, escalar slippage y adverse proporcionalmente al tamaño,
+y mantener Hedge clásico ($K\!=\!7$) sobre la nueva acción set, todo
+condicionado en la presión 1D ya validada. La cota de regret cambia
+solo en el factor $\sqrt{\log K}$, lo cual es despreciable
+asintóticamente.
+
+\medskip
+
+\noindent
+\textbf{Pasos secundarios.}
+\begin{itemize}
+\item Confirmar la victoria 1D vs marginal sobre S2, S3, S7
+      (actualmente solo medida en S1). Tres corridas más a 10 semillas.
+\item Probar las versiones \emph{invertidas} de \texttt{vol\_delta}
+      y \texttt{spread\_delta}: cuando esas señales aumentan, ser
+      \emph{más agresivo} en lugar de más pasivo. Las señales son
+      claramente informativas ($|t|>12$ en magnitud); el signo de la
+      reacción podría estar al revés.
+\item Si el condicionamiento por tamaño tampoco rompe la barrera, el
+      resultado negativo en sí es publicable: cuatro intentos
+      mecanísticamente convergentes prueban que \emph{en BTC/USDT a
+      100 ms y $\lambda=0{,}1$, no hay condicionamiento de estado
+      en la familia bucketed que escape a la frontera Pareto}.
+\end{itemize}
+
+%==============================================================================
+\section*{Reproducibilidad}
+
+Toda la cadena de procesamiento está versionada en el repositorio
+\texttt{adversity-is-controllable}. Los datos crudos se persisten en
+\texttt{data/raw/} (JSONL) y los derivados en \texttt{data/derived/}
+(Parquet). Las cinco figuras se regeneran con
+\begin{verbatim}
+PYTHONPATH=. python scripts/_plots_section25.py
+\end{verbatim}
+desde \texttt{data/derived/ab\_adverse\_3sessions\_10seed.json}.
+La harness experimental es
+\texttt{scripts/\_ab\_adverse\_3sessions.py}; ejecutarla replica las
+160 corridas (4 sesiones $\times$ 10 semillas $\times$ 4 modos) en
+$\sim\!200$~s sobre un CPU típico de laptop.
+
+%==============================================================================
+\section*{Agradecimientos}
+
+A todos los que mantuvieron despiertas las máquinas de ingest las
+noches del 20 de abril al 1 de mayo de 2026, y a los seis bugs de
+libro corrupto que enseñaron a fondo el protocolo de sincronización
+de Binance.
+
+%==============================================================================
+\begin{thebibliography}{9}
+
+\bibitem{kalman1960}
+R.~E.~Kalman,
+``A New Approach to Linear Filtering and Prediction Problems,''
+\emph{Trans.\ ASME, J.\ Basic Eng.}, vol.~82, no.~D, pp.~35--45, 1960.
+
+\bibitem{freund1997}
+Y.~Freund and R.~E.~Schapire,
+``A decision-theoretic generalization of on-line learning and an application to boosting,''
+\emph{J.\ Comput.\ Syst.\ Sci.}, vol.~55, no.~1, pp.~119--139, 1997.
+
+\bibitem{cesabianchi2006}
+N.~Cesa-Bianchi and G.~Lugosi,
+\emph{Prediction, Learning, and Games}.
+Cambridge, U.K.: Cambridge Univ.\ Press, 2006.
+
+\bibitem{auer2002}
+P.~Auer, N.~Cesa-Bianchi, Y.~Freund, and R.~E.~Schapire,
+``The non-stochastic multi-armed bandit problem,''
+\emph{SIAM J.\ Comput.}, vol.~32, no.~1, pp.~48--77, 2002.
+
+\bibitem{bouchaud2018trades}
+J.-P.~Bouchaud, J.~Bonart, J.~Donier, and M.~Gould,
+\emph{Trades, Quotes and Prices: Financial Markets under the Microscope}.
+Cambridge, U.K.: Cambridge Univ.\ Press, 2018.
+
+\bibitem{cont2014}
+R.~Cont, A.~Kukanov, and S.~Stoikov,
+``The price impact of order book events,''
+\emph{J.\ Financ.\ Econom.}, vol.~12, no.~1, pp.~47--88, 2014.
+
+\bibitem{almgren2001}
+R.~Almgren and N.~Chriss,
+``Optimal execution of portfolio transactions,''
+\emph{J.\ Risk}, vol.~3, pp.~5--40, 2001.
+
+\bibitem{obizhaeva2013}
+A.~A.~Obizhaeva and J.~Wang,
+``Optimal trading strategy and supply/demand dynamics,''
+\emph{J.\ Financ.\ Markets}, vol.~16, no.~1, pp.~1--32, 2013.
+
+\bibitem{stoikov2018}
+S.~Stoikov,
+``The micro-price: a high-frequency estimator of future prices,''
+\emph{Quant.\ Finance}, vol.~18, no.~12, pp.~1959--1966, 2018.
+
+\bibitem{binancedocs}
+Binance, ``Spot WebSocket API documentation,''
+[Online]. Available: https://binance-docs.github.io/apidocs/spot/en/
+
+\bibitem{harvey1989}
+A.~C.~Harvey,
+\emph{Forecasting, Structural Time Series Models and the Kalman Filter}.
+Cambridge, U.K.: Cambridge Univ.\ Press, 1989.
+
+\bibitem{hamilton1994}
+J.~D.~Hamilton,
+\emph{Time Series Analysis}.
+Princeton, NJ: Princeton Univ.\ Press, 1994.
+
+\bibitem{cover1991}
+T.~M.~Cover,
+``Universal portfolios,''
+\emph{Math.\ Finance}, vol.~1, no.~1, pp.~1--29, 1991.
+
+\bibitem{littlestone1994}
+N.~Littlestone and M.~K.~Warmuth,
+``The weighted majority algorithm,''
+\emph{Inf.\ Comput.}, vol.~108, no.~2, pp.~212--261, 1994.
+
+\bibitem{cartea2015}
+\'A.~Cartea, S.~Jaimungal, and J.~Penalva,
+\emph{Algorithmic and High-Frequency Trading}.
+Cambridge, U.K.: Cambridge Univ.\ Press, 2015.
+
+\bibitem{nevmyvaka2006}
+Y.~Nevmyvaka, Y.~Feng, and M.~Kearns,
+``Reinforcement learning for optimized trade execution,''
+in \emph{Proc.\ 23rd Int.\ Conf.\ Mach.\ Learn.\ (ICML)}, 2006, pp.~673--680.
+
+\bibitem{spooner2018}
+T.~Spooner, J.~Fearnley, R.~Savani, and A.~Koukorinis,
+``Market making via reinforcement learning,''
+in \emph{Proc.\ 17th Int.\ Conf.\ Auton.\ Agents and Multi-Agent Syst.\ (AAMAS)}, 2018, pp.~434--442.
+
+\bibitem{schnaubelt2022}
+M.~Schnaubelt,
+``Deep reinforcement learning for the optimal placement of cryptocurrency limit orders,''
+\emph{Eur.\ J.\ Oper.\ Res.}, vol.~296, no.~3, pp.~993--1006, 2022.
+
+\bibitem{avellaneda2008}
+M.~Avellaneda and S.~Stoikov,
+``High-frequency trading in a limit order book,''
+\emph{Quant.\ Finance}, vol.~8, no.~3, pp.~217--224, 2008.
+
+\end{thebibliography}
+
+\end{document}

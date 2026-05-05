@@ -782,5 +782,2990 @@ Remaining gaps to a clean research result
 
 
 ================================================================================
- END OF REPORT — 2026-04-21
+16. WAKING UP THE DEAD REGIME DIMENSION (2026-04-22)
+================================================================================
+
+Written in plain language on purpose. The math is in src/state/kalman_filter.py
+and configs/kalman.yaml if you want it.
+
+WHAT WAS BROKEN
+---------------
+The Kalman filter tracks two hidden numbers at every tick:
+  - market_pressure  : are people buying or selling harder right now?
+  - regime           : how turbulent is the market right now?
+
+market_pressure worked fine. regime was dead.
+
+"Dead" means: no matter what the market did, regime barely moved.
+Its standard deviation was about 0.00003. That is so small it might as
+well be zero. The policy could not use it for anything.
+
+WHY WAS IT DEAD
+---------------
+The filter got regime from one feature: vol_5s (volatility over the last
+5 seconds).
+
+Two problems with vol_5s:
+
+  1. It's tiny.
+     The biggest value we ever saw in 10.85h of data was 0.00071.
+     The average was 0.00002.
+     A tiny input can't produce a big output. Nothing we tweaked inside
+     the filter (we tried — see §8) made regime any bigger, because the
+     raw input itself was already that small.
+
+  2. It's dead most of the time.
+     Only 46 out of every 100 ticks had a nonzero vol_5s.
+     Why? BTC price moves in $0.01 steps. In a 5-second window, the
+     mid-price often doesn't move at all. No movement → log return = 0
+     → volatility = 0. Lots of silence.
+
+So regime was fed a tiny, silent signal. It produced a tiny, silent output.
+
+THE FIX — THREE SIMPLE STEPS
+----------------------------
+Step 1. Switch from vol_5s to vol_30s.
+  vol_30s is the same idea but over 30 seconds instead of 5.
+  On the same data:
+    vol_5s  was nonzero in 45.85% of ticks.
+    vol_30s is nonzero in 91.47% of ticks.
+  Twice as much signal. Much less silence.
+
+Step 2. Rescale the number before the filter sees it.
+  vol_30s is still tiny on an absolute scale (max ≈ 0.00031). So we
+  "zoom in" on it by computing:
+
+      rescaled = (vol_30s − average_vol_30s) / size_of_typical_vol_30s
+
+  After this:
+    - If vol_30s is exactly average, rescaled = 0.
+    - If vol_30s is one typical step above average, rescaled = 1.
+    - If two steps above, rescaled = 2. And so on.
+
+  The filter sees values in the range a human would use, not numbers
+  a millionth the size.
+
+  The constants we measured on clean data:
+      average_vol_30s   = 0.0000317
+      typical step size = 0.0000271
+  We hard-coded these into configs/kalman.yaml as obs_center and
+  obs_scale. If the market's volatility character changes drastically
+  in future data, these should be recomputed.
+
+Step 3. Tell the filter the rescaled input has noise of size 1.
+  Because we made the input unit-scale, its noise is also size 1 by
+  construction. Set R[2,2] = 1.0 and the math just works.
+
+AFTER THE FIX (same 38,972 ticks, same everything else)
+-------------------------------------------------------
+regime statistic             BEFORE          AFTER
+--------------------------------------------------------
+std                          0.0000317       0.3709
+min                          0.0000000      -0.7903
+max                          0.0007141      +4.0941
+p01                         ~0              -0.5007
+p50                         ~0              -0.0656
+p99                         ~0              +1.2224
+
+regime went from "flatline" to "actually moves with the market."
+
+Sanity check: did we break anything else? No.
+  Total loss (λ=0.1)     1,458    (10-seed A/B mean was 1,415 ± 21 — within noise)
+  Fill rate              53.5%    (was 53.5%)
+  Total slippage         $49.66   (was $48.74 ± 3.33 across 10 seeds)
+  Action mix             W 45% / P 17% / A 37%   (was 45 / 16 / 39)
+  Final weights          W 0.54 / P 0.20 / A 0.26
+
+All core metrics unchanged within noise. We just turned on a switch that
+was off.
+
+WHAT THIS UNLOCKS
+-----------------
+regime now has real values that make bucket edges sensible:
+
+  regime ≤ −0.3     calm           (bottom ~20% of ticks)
+  −0.3 < r ≤ +0.3   normal         (middle ~60%)
+  regime >  +0.3    elevated / spike (top ~20%)
+
+The next logical A/B is 2D bucketing: (market_pressure, regime) → one
+Hedge weight vector per combined bucket. That's the experiment the
+pressure-only bucketed policy couldn't do before because regime had
+no signal to bucket on. That is Next Up.
+
+WHAT CODE CHANGED
+-----------------
+  src/state/kalman_filter.py
+    - KalmanConfig gained two optional fields: obs_center, obs_scale.
+    - KalmanFilter.step() applies  z = (z − obs_center) * obs_scale
+      before the update step. Defaults are identity (0, 1) so any old
+      config still works as before.
+
+  configs/kalman.yaml
+    - obs_features: vol_5s → vol_30s
+    - Added obs_center: [0.0, 0.0, 3.1658e-5]
+    - Added obs_scale:  [1.0, 1.0, 36876.637]
+    - R[2,2]: 1.249e-9 → 1.0 (unit-variance by construction after rescaling)
+
+depth_imbalance and ofi_l1 are NOT rescaled. They were already on fine
+scales, and the pressure-bucket edges in configs/policy.yaml are
+calibrated to the raw pressure scale. Touching them would invalidate
+the existing bucket layout and the 10-seed A/B result.
+
+
+================================================================================
+17. SESSION-AWARE DATA LOADING IN SCRIPT 6 (2026-04-22)
+================================================================================
+
+WHAT WAS BROKEN
+---------------
+Script 6 used to run on ALL feature data in one shot. No way to restrict
+it to a slice.
+
+If two ingest sessions accidentally landed in the features folder
+(picture: leave ingest running overnight, it hits a WS gap at 3am,
+recovers at 3:05am, keeps going) script 6 would treat them as ONE long
+stream. The Kalman filter's state at the start of the second session
+would be whatever it was at the end of the first — an estimate of
+market conditions from hours ago, applied to "now."
+
+That's wrong. The Kalman filter is stateful. Its answer for tick t
+depends on its memory of every tick before. If there's an actual gap,
+that memory is stale.
+
+WHAT IS A SESSION
+-----------------
+A session is an uninterrupted stream of ticks. No gaps. No WS
+disconnects. No manual ingest restarts in the middle.
+
+Calendar days DO NOT define sessions. Our current data starts at
+19:54 UTC on 2026-04-20 and runs to 06:43 UTC the next day — that is
+ONE session, even though it crosses midnight. Splitting it by calendar
+date would chop it into two artificially.
+
+What matters is: are consecutive ticks actually next to each other in time?
+
+WHAT SCRIPT 6 DOES NOW
+----------------------
+At startup it:
+  1. Loads every feature row from data/derived/features/.
+  2. Walks through them. A new session begins at any of:
+       a. the first row
+       b. a row with sequence_gap=True
+       c. a row whose timestamp is more than 5 SECONDS after the
+          previous row
+     (Normal ticks are ~1s, so 5s is generous — it won't false-positive
+     on ordinary jitter, but it will catch any real interruption.)
+  3. Prints a table of every session found: index, row count, duration
+     in hours, start time, end time.
+  4. Runs the pipeline on the LONGEST session by default.
+
+CLI flags
+---------
+  python3 scripts/6_simulate_and_update.py
+      → run on the longest detected session (safest default)
+
+  python3 scripts/6_simulate_and_update.py --list-sessions
+      → print the session table and exit, without running anything
+
+  python3 scripts/6_simulate_and_update.py --session 2
+      → pick session #2 from the table (1-indexed) instead of the longest
+
+CURRENT STATE — WHAT YOU SEE RIGHT NOW
+--------------------------------------
+  Detected 1 session(s) in data/derived/features:
+    idx  rows    hours   start                    end
+    1    38973   10.83   2026-04-20 19:54:00 UTC  2026-04-21 06:43:32 UTC
+  Running on session 1 — 38973 rows ...
+
+One session because the clean 10.85h window has zero gaps. If future
+overnight ingest runs introduce new gaps, the new sessions will show
+up in this table automatically.
+
+WHY "LONGEST" IS THE RIGHT DEFAULT
+----------------------------------
+- More data → more tick-by-tick updates → Hedge's regret bound tightens
+  (the formal guarantee is O(√(T log K))).
+- The longest contiguous session is always the cleanest big slice of
+  data available. Picking shorter sessions by default would silently
+  throw away signal.
+- For generalization tests you WANT to pick non-default sessions so you
+  can train on one and evaluate on another. That's why the flag exists.
+
+WHAT DIDN'T CHANGE
+------------------
+- Kalman filter code is untouched by this change (except §16's rescaling).
+- Policy code is untouched.
+- The execution log format is unchanged (run-ID partitioned as before).
+- Output behaviour for a single-session data directory is identical to
+  the old behaviour — the script still processes every available tick.
+
+
+================================================================================
+ END OF REPORT — 2026-04-22
+================================================================================
+
+
+================================================================================
+18. SECOND OVERNIGHT INGEST — VERIFIED CLEAN (2026-04-27 → 2026-04-28)
+================================================================================
+
+What we did
+-----------
+Left the ingest running all night on April 27. Woke up on April 28 and
+checked everything.
+
+  caffeinate -disu &                    # keep mac awake
+  python scripts/1_ingest_ws.py         # WS first, periodic snapshots auto
+
+Then ran the same checks from §3 on the new data.
+
+What we found — IT'S CLEAN
+--------------------------
+  Total depth events:       398,774
+  Span:                     11.08 h    (UTC 2026-04-28 02:57:49 → 14:02:31)
+  Snapshots saved:          45         (one every 15 minutes — patch §5.2 worked)
+  Sequence gaps in stream:  0          ← zero. perfect overnight.
+
+The big change from April 21: NO WS DISCONNECTS. Last time we had two
+disconnects clustered in hour 06 UTC (sanity §3). This time, none. The
+internet held all night.
+
+One small startup quirk
+-----------------------
+The first snapshot has uid 92,798,379,031.
+The first WS event has first_update_id 92,798,379,164.
+The snapshot is 132 uids BEHIND the first event.
+
+What happened: WS started capturing slightly AFTER the snapshot was taken
+(should be the other way per §2). So we missed 132 uids of book changes
+between "snapshot taken" and "WS first message logged."
+
+Why we don't care
+-----------------
+The §5.1 self-heal logic catches this automatically. Walks through:
+  1. Builder seeds from snapshot 1 (uid = 92,798,379,031)
+  2. First event arrives with first_update_id = 92,798,379,164
+  3. 92,798,379,164 > 92,798,379,031 + 1   → GAP DETECTED
+  4. Looks at snapshot 2 (uid = 92,799,076,659, taken 15 min later)
+  5. 92,799,076,659 + 1 ≥ 92,798,379,164   → BRIDGE FOUND
+  6. Reseed from snapshot 2. Skip events with uid ≤ 92,799,076,659.
+  7. Resume cleanly from there.
+
+Cost: we lose the first ~17 minutes of the captured stream. The book
+state from minute 17 onward is correct and sequence_gap=False on every
+single feature row.
+
+Actual log line during regen:
+  "Sequence gap at uid=92403688126 first=92798379164 expected=92403688127"
+  "Gap recovered: reseeded from snapshot_1777345969402.json uid=92799076659"
+
+(The "92403688126" in the log is the last uid from the OLD Apr-21 data —
+the builder processed the old session, then the cross-session jump to
+Apr-28 looks like a giant gap, which it self-heals exactly the same way.)
+
+Feature regeneration
+--------------------
+  scripts/3_featuregen.py   →   77,950 features written
+                                = 38,973 from old Apr-20/21 session
+                                + 38,977 from new Apr-28 session
+
+Feature-level sanity (§6 checks, all 38,977 rows of new session)
+-----------------------------------------------------------------
+  1. mid_price <= best_ask_px:     PASS  0/38,977
+  2. mid_price >= best_bid_px:     PASS  0/38,977
+  3. spread_abs > 0:               PASS  0/38,977
+  4. best_ask_px > best_bid_px:    PASS  0/38,977
+  5. microprice <= best_ask_px:    PASS  0/38,977
+  6. microprice >= best_bid_px:    PASS  0/38,977
+  7. sequence_gap=True rows:       0/38,977 (0.0000%)
+
+vol_30s nonzero in 91.40% of ticks. Matches §16's expectation (91.47%).
+
+Observed feature ranges (Apr-28 session)
+----------------------------------------
+  best_bid_px:      75,962.86 → 77,150.56
+  best_ask_px:      75,962.87 → 77,150.57
+  spread_abs:       median=0.0100  max=11.0200
+  vol_5s:           median=0       max=0.0057
+  vol_30s:          median=0       max=0.0057    ← 18× the Apr-21 max
+  depth_imbalance:  median=-0.0418  std=0.6468
+  ofi_l1:           median=+0.0002  std=1.8587
+
+vol_30s being 18× larger than the calibration window means there were
+real volatility spikes during this session. See §19 for why this matters.
+
+Session detection (§17)
+-----------------------
+Script 6 sees TWO sessions (the Apr-21 window and the Apr-28 window),
+correctly split because the time gap between them is ~7 days >> 5s.
+  idx  rows    hours  start                    end
+   1   38973   10.83  2026-04-20 19:54:00 UTC  2026-04-21 06:43:32 UTC
+   2   38977   10.83  2026-04-28 03:12:50 UTC  2026-04-28 14:02:31 UTC
+
+Step-6 baseline run on session 2 (mode=bucketed, single seed=None)
+-------------------------------------------------------------------
+Just to confirm everything works end-to-end on the new data:
+
+  Action mix:        WAIT 46.6%  PASSIVE 16.5%  AGGRESSIVE 36.9%
+  Fill rate (PASS):  92.22%
+  Fill rate (AGGR):  100.00%
+  Slippage signs:    PASSIVE -0.005  AGGR +0.005   (correct physics)
+  Total slippage:    $41.45
+  Total adverse:     15,397
+  Total loss (λ=0.1):1,581
+  Pressure range:    [-1.05, +0.49]
+  Regime range:      [-0.72, +82.91]   ← see "the regime spike" below
+
+Action mix and bucket shapes mirror the Apr-21 reference (sanity §15)
+within seed noise.
+
+The regime spike
+----------------
+On Apr-21 data, regime ranged [-0.79, +4.09] with std 0.37 (§16).
+On Apr-28 data, regime ranges [-0.72, +82.91].
+
+The difference is real: Apr-28 had vol_30s peaks of 0.0057 vs Apr-21's
+peak of 0.00031. About 18× larger. The §16 standardization
+  rescaled = (vol_30s − 3.1658e-5) * 36876.637
+faithfully passes that through, so regime fires huge during spikes.
+
+This is the standardization constants getting "stretched" by data more
+volatile than the calibration window. Two responses are reasonable:
+  (a) Accept it. The big values are rare and the buckets in §19 catch
+      them in the top regime bucket. The math is correct, just unusual.
+  (b) Recompute obs_center/obs_scale on the union of both sessions
+      so the typical-step-size constant reflects both market regimes.
+      Quick — see project_state.md "when to recompute".
+We did NOT recompute for the §19 / §20 experiment; we accepted (a). If
+2D buckets show signs of overfitting on the regime spike (they kind of
+do — see §20), recomputing is a sensible follow-up.
+
+Bottom line for §18: data is clean, code paths from §5 / §16 / §17 all
+worked overnight without intervention, ready for the 2D experiment in §19.
+
+
+================================================================================
+19. NEW IDEA — 2D BUCKETING (PRESSURE × REGIME): WHAT, WHY, EXPECTED
+================================================================================
+
+Caveman brain version. The math is in src/policy/hedge.py if you want it.
+
+THE QUESTION (still the same)
+-----------------------------
+"Given current market conditions, how should we act?"
+
+Conditions = two numbers from the Kalman filter:
+  market_pressure   : are people buying or selling harder right now?
+  regime            : how turbulent is the market right now?
+
+THE STORY SO FAR
+----------------
+- Marginal Hedge (the old one): IGNORES both numbers. Picks one action
+  distribution and uses it everywhere. Like wearing the same shoes
+  to the beach, the gym, and a wedding.
+
+- 1D bucketed Hedge (§15): looks at PRESSURE only. Different shoes for
+  different pressure. Beat marginal by ~29% on combined cost. Big win.
+
+- regime was DEAD until §16. Couldn't bucket on it. Now alive.
+
+WHAT WE'RE ADDING NOW (§19)
+---------------------------
+2D bucketed Hedge: looks at PRESSURE *AND* REGIME together. One set of
+weights per (pressure_bucket, regime_bucket) pair.
+
+THE ANALOGY
+-----------
+Imagine you're crossing a busy street.
+  Pressure = "how many cars are coming."
+  Regime   = "how fast they are moving."
+
+A 1D-pressure-only policy says:
+  "Lots of cars coming → wait. Few cars coming → walk."
+
+A 2D policy says:
+  "Lots of cars coming AND moving slow → walk anyway, you can dodge."
+  "Lots of cars coming AND moving fast → wait, definitely wait."
+  "Few cars coming AND moving slow → stroll."
+  "Few cars coming AND moving fast → still walk, but quickly."
+
+The 2D policy can give you a different answer for the same number of
+cars depending on how fast they are. That's the whole point.
+
+HOW MANY BUCKETS, AND WHY
+-------------------------
+Pressure: 6 buckets (kept the same edges as 1D so we can A/B on apples).
+  pressure_edges = [-0.5, -0.2, 0.0, 0.2, 0.5]
+
+Regime: 3 buckets. We chose:
+  regime_edges = [-0.3, +0.3]
+    bucket "calm"      regime ≤ -0.3
+    bucket "normal"    -0.3 < regime ≤ +0.3
+    bucket "elevated"  regime > +0.3
+
+Why these edges? On Apr-21 data, p20≈-0.5, p50≈-0.07, p80≈+0.3. So
+[-0.3, +0.3] roughly splits ticks into bottom 20% / middle 60% / top
+20%. Each bucket gets enough data to learn from. (Apr-28 data is
+shifted; see "expected behavior" below.)
+
+Total cells: 6 × 3 = 18.
+
+Data per cell on average: 38,977 / 18 ≈ 2,165 ticks. 1D was ~6,500
+per bucket. So each cell has 1/3 the data of 1D. Less data per cell
+= noisier learning per cell.
+
+WHAT THIS COSTS
+---------------
+1. Sample size per cell shrinks 3× → noisier weights.
+2. Some corner cells will be very sparse. Heavy buy + spike regime is
+   rare; might get hundreds of ticks not thousands. Weights barely
+   move from uniform.
+3. Same total data, more parameters to fit. Classic statistical
+   tradeoff.
+
+WHAT WE EXPECT TO SEE
+---------------------
+Best case ("the thesis works for 2D too"):
+  Some (pressure, regime) combinations have a different best action
+  than the marginal pressure bucket. For example: heavy-buy + spike
+  might prefer AGGRESSIVE even more than heavy-buy + calm. The 2D
+  policy learns these. Total loss drops below 1D bucketed by some %.
+
+Middle case ("regime is informative but undersampled"):
+  2D is competitive with 1D but not significantly better. Saved by the
+  cells where regime helps, dragged down by the sparse cells.
+
+Worst case ("regime is decorative for this loss"):
+  2D is WORSE than 1D. The regime signal didn't carry useful info for
+  the slippage / adverse-move loss; cell-level noise dominates.
+
+Note on Apr-28 data
+-------------------
+Regime spiked to +82.9 on this session (§18). Anything with regime > 0.3
+falls in the "elevated" bucket. So that bucket is over-populated by the
+spike — most "elevated" ticks are during a few high-vol bursts, not
+spread evenly across the session. If those bursts had unusual best
+actions, the elevated bucket will learn them. If those bursts were
+chaotic (no consistent best action), the elevated bucket will just
+have noisy weights.
+
+THE CHANGE — TWO FILES, ZERO TO THE OLD CODE PATH
+-------------------------------------------------
+1. src/policy/hedge.py
+   - Added BucketedHedge2DPolicy class (mirrors BucketedHedgePolicy
+     but with two edge arrays and a 2D bucket lookup).
+   - Added "bucketed_2d" mode to make_policy().
+   - PolicyConfig gained an optional regime_edges field. Default empty.
+
+2. configs/policy.yaml
+   - Added regime_edges: [-0.3, 0.3]
+   - Added "bucketed_2d" to mode docs.
+
+3. scripts/6_simulate_and_update_2d.py  (NEW)
+   - Sibling of 6_simulate_and_update.py.
+   - Forces mode='bucketed_2d' regardless of YAML.
+   - Logs all 18 cells in bucket_summary.
+
+The old 1D script (6_simulate_and_update.py) is unchanged in behaviour.
+Configs/policy.yaml's mode field still says "bucketed", so running the
+old script still gives the §15 1D-pressure-only result. Run them back
+to back for an A/B.
+
+HOW TO RUN
+----------
+  PYTHONPATH=. python scripts/6_simulate_and_update.py     --session 2 --seed 0
+  PYTHONPATH=. python scripts/6_simulate_and_update_2d.py  --session 2 --seed 0
+
+Same seed → paired comparison. Different seeds → independent samples.
+
+
+================================================================================
+20. ACTUAL RESULT — 5-SEED PAIRED A/B (1D vs 2D, Apr-28 SESSION)
+================================================================================
+
+Setup
+-----
+  Data:           Apr-28 session 2, 38,977 features (the new clean window)
+  Features:       same parquet for both modes
+  Kalman config:  same (post-§16 — regime alive, vol_30s standardized)
+  Execution:      λ = 0.1, η = 0.1
+  Seeds:          0, 1, 2, 3, 4
+  Modes:          1D bucketed (pressure only) vs 2D bucketed (pressure × regime)
+  Protocol:       paired by seed, in-memory only, no disk spam
+                  (mirrors §15 protocol with 5 seeds instead of 10)
+
+Per-seed results
+----------------
+  seed mode  loss      slippage  adv_move    fill%   action mix W/P/A
+  -------------------------------------------------------------------------
+   0   1D    1513.34   $37.45    14758.91   54.31%   44.4 / 19.1 / 36.5
+   0   2D    1625.50   $32.16    15933.42   55.72%   42.8 / 21.3 / 36.0
+   1   1D    1535.11   $43.68    14914.32   53.16%   45.6 / 17.6 / 36.8
+   1   2D    1624.57   $37.06    15875.08   54.10%   44.5 / 20.0 / 35.6
+   2   1D    1557.76   $41.45    15163.18   54.76%   44.0 / 18.1 / 37.9
+   2   2D    1645.88   $34.61    16112.71   56.30%   42.3 / 20.8 / 37.0
+   3   1D    1603.49   $44.36    15591.29   54.09%   44.6 / 18.1 / 37.2
+   3   2D    1712.24   $38.00    16742.44   55.03%   43.5 / 20.4 / 36.1
+   4   1D    1563.34   $50.34    15130.04   54.42%   44.3 / 18.2 / 37.5
+   4   2D    1656.80   $43.24    16135.64   55.48%   43.0 / 20.7 / 36.2
+
+  Total loss (λ=0.1): 2D > 1D in 5 out of 5 seeds. Not random.
+
+Aggregate (mean ± std across 5 seeds)
+-------------------------------------
+  metric                      1D                  2D
+  ----------------------------------------------------------------
+  Total loss (λ=0.1)        1,554.61 ± 30.20    1,653.00 ± 32.06
+  Total slippage ($)           43.45 ±  4.21       37.01 ±  3.72
+  Total adverse_move        15,111.55 ± 281.57  16,159.86 ± 308.09
+  Fill rate                    54.15% ±  0.54%     55.33% ±  0.74%
+
+Action mix (mean across 5 seeds)
+--------------------------------
+  WAIT         1D 44.58%   2D 43.22%      ↓ 1.4pp
+  PASSIVE      1D 18.22%   2D 20.61%      ↑ 2.4pp
+  AGGRESSIVE   1D 37.20%   2D 36.17%      ↓ 1.0pp
+
+Paired difference (2D_loss − 1D_loss, same seed)
+------------------------------------------------
+  mean diff = +98.39
+  std       = 11.25
+  t-stat    = +19.55  (n=5)
+  → 2D LOSES vs 1D by 98 loss units / run on combined cost (λ=0.1).
+    The signal is ~9x larger than the noise. Real, not lucky.
+
+  For reference, |t| > 2-3 is "significant". |t|=19.55 is overwhelming.
+  But this time the overwhelming signal points the OTHER way from §15.
+
+Apples-to-apples loss at different λ values (mean across 5 seeds)
+-----------------------------------------------------------------
+  λ        1D            2D            improvement   rel
+  --------------------------------------------------------------
+  0.00       43.45         37.01           +6.44     +14.82%   ← 2D WINS
+  0.10    1,554.61      1,653.00          -98.39      -6.33%
+  0.25    3,821.34      4,076.98         -255.64      -6.69%
+  0.50    7,599.23      8,116.94         -517.72      -6.81%
+  1.00   15,155.00     16,196.87       -1,041.87      -6.87%
+
+THIS IS A FORK IN THE ROAD
+--------------------------
+At λ=0 (PURE SLIPPAGE — what you'd see on a broker invoice as
+"$ paid above mid"), 2D BEATS 1D by 15%.
+
+At any λ ≥ 0.1 (combined slippage + adverse-move risk), 2D LOSES by
+~7% across the board.
+
+WHY THE SPLIT — SIMPLE EXPLANATION
+----------------------------------
+Look at the action mix. 2D learned to take MORE PASSIVE (+2.4pp) and
+LESS WAIT (-1.4pp). PASSIVE earns the spread when it fills (saves
+slippage). But passive fills are toxic — they execute right before
+unfavorable price moves on average (sanity §7). So:
+
+  Slippage:     2D fills more passively   → SAVES money on spread.
+                Apr-28 session: $6 saved per run (15%).
+  Adverse:      Passive fills are toxic   → COSTS money on the next move.
+                Apr-28 session: +1,048 in extra adverse_move per run.
+
+At λ=0 only the first matters. At λ=0.1 the adverse cost is
+0.1 × 1,048 = $104.8, which is way more than the $6.44 slippage saving.
+So the combined cost goes UP.
+
+In one sentence: 2D got MORE clever about WHEN to fill, but the extra
+fills came with toxicity that the loss function (at λ=0.1) penalizes
+more than the spread saving rewards.
+
+WHY DIDN'T 1D HAVE THIS PROBLEM
+-------------------------------
+1D buckets on pressure only. In each pressure bucket, Hedge had ~6.5k
+ticks to settle on the right action. The right action in heavy-buy is
+AGGRESSIVE (no toxicity — you take liquidity, you don't post). The
+right action in heavy-sell is WAIT (no fill, no slippage, no adverse).
+1D was already near-optimal at avoiding toxic PASSIVE fills.
+
+When we add the regime split, each cell has ~2.1k ticks. Hedge converges
+slower per cell. In particular, the "near-zero pressure × any regime"
+cells are where PASSIVE has the strongest competition — and 2D's smaller
+sample size in those cells means it didn't down-weight PASSIVE as
+aggressively. Result: 2D ends up posting more limit orders in the
+neutral-pressure cells, which is exactly where toxic flow lives.
+
+WHAT THIS DOES AND DOESN'T MEAN
+-------------------------------
+DOES mean:
+  - "More state dimensions = better" is NOT free. Sample-size-per-cell
+    matters as much as conditioning information.
+  - On THIS data, with THIS loss (λ=0.1), 1D pressure-only is a better
+    policy than 6×3 pressure×regime.
+  - For pure execution-quality (slippage), 2D still wins. If the user
+    of this system cares only about spread paid (e.g. a market-maker
+    that hedges adverse risk separately), 2D is the right answer.
+
+DOES NOT mean:
+  - 2D "doesn't work." It works fine; it's a different operating point
+    on the slippage / adverse tradeoff. The loss function at λ=0.1
+    chose 1D. A different λ chooses differently.
+  - regime is useless. Regime DID change behaviour (more PASSIVE in
+    calm cells, less in spike cells). The change just wasn't
+    profitable at λ=0.1 with 18 cells × 38k ticks of data.
+  - The thesis is broken. The thesis says "state-conditioned > marginal";
+    1D bucketed wins by 29% (§15) vs marginal still holds. The thesis
+    was never "more states monotonically better."
+
+LEVERS WORTH PULLING NEXT (NOT YET DONE)
+----------------------------------------
+1. Quantile-based regime_edges instead of fixed [-0.3, +0.3]. The Apr-28
+   regime distribution is fat-tailed (max 82.9 from a calibration window
+   that maxed at 4.1). Quantile edges would put each bucket near 1/3 of
+   the data instead of letting the spike dominate the "elevated" bucket.
+
+2. Recompute obs_center/obs_scale on Apr-20/21 + Apr-28 union so the
+   standardization reflects both regimes. Currently it's calibrated only
+   on Apr-21, which is why Apr-28 spikes look unusually large.
+
+3. Coarser regime split: 2 buckets instead of 3 (just regime_edges=[0]).
+   More data per cell, simpler policy. Possibly Pareto-better than 3.
+
+4. Higher η (0.2-0.3) for 2D specifically. With less data per cell, a
+   bigger learning rate may help converge before the run ends. Risk:
+   overshoots in spike cells.
+
+5. More data. A second 10h window won't fix sample-size-per-cell at the
+   margin; we'd need 5-10× the data. Worth it long-term but not the
+   first thing to try.
+
+6. Different loss. Per (§9), λ=0.1 was chosen so PASSIVE is penalized
+   for adverse selection but not crushed. λ=0.05 would give 2D's "more
+   PASSIVE" stance more credit. λ=0.2 would punish it harder. The
+   research question is whether the BEST 2D is better than the BEST 1D
+   under each λ — so this lever is the "honest" one if we want to know
+   if 2D has a regime where it dominates.
+
+REPORTING TAKEAWAY
+------------------
+Two policies, same data, same Kalman, same execution model. They make
+different tradeoffs:
+  1D is better at COMBINED COST (slippage + adverse penalty).
+  2D is better at PURE SLIPPAGE.
+On a research project asking "given conditions, how to act?" the answer
+is "depends on what you're optimizing." Both policies are using the
+Kalman state — they're just using it to land on different points along
+the spread-vs-toxicity frontier. That itself is a publishable finding.
+
+
+================================================================================
+ END OF REPORT — 2026-04-28
+================================================================================
+
+
+================================================================================
+21. THE 10-SEED A/B — 1D vs 2D BUCKETING (THE BIG ONE)
+================================================================================
+
+Why this section exists
+-----------------------
+§20 was a quick 5-seed look. §15 is the gold standard for this project —
+ten seeds, paired by seed, in-memory only. We ran the SAME protocol here
+for 1D bucketed vs 2D bucketed on the new Apr-28 session so the result
+sits next to §15 with the same rigor.
+
+Same data, same Kalman config, same execution loss, same η. Only the
+policy variant changes between paired runs.
+
+Setup
+-----
+  Data:           Apr-28 session (38,977 features, 10.83h)
+  Features:       same parquet for both modes
+  Kalman config:  post-§16 (regime alive, vol_30s standardized)
+  Execution:      λ = 0.1, η = 0.1
+  Seeds:          0, 1, 2, 3, 4, 5, 6, 7, 8, 9   (ten)
+  Modes:          1D bucketed (pressure only) vs 2D bucketed (pressure × regime)
+  Protocol:       paired by seed; same RNG seed used for both modes
+                  in each pair so any difference comes from the policy,
+                  not the dice
+  Raw output:     data/derived/ab_2d_vs_1d_apr28_10seed.json
+                  (full per-seed dict with every aggregate number;
+                   safe to load for plotting later)
+
+Per-seed table (numbers ready for figures)
+==========================================
+
+seed  mode  loss      slippage    adverse     fill%    W%     P%     A%
+----------------------------------------------------------------------------
+ 0    1D    1513.34   37.45     14758.91     54.31    44.4   19.1   36.5
+ 0    2D    1625.50   32.16     15933.42     55.72    42.8   21.3   36.0
+ 1    1D    1535.11   43.68     14914.32     53.16    45.6   17.6   36.8
+ 1    2D    1624.57   37.06     15875.08     54.10    44.5   20.0   35.6
+ 2    1D    1557.76   41.45     15163.18     54.76    44.0   18.1   37.9
+ 2    2D    1645.88   34.61     16112.71     56.30    42.3   20.8   37.0
+ 3    1D    1603.49   44.36     15591.29     54.09    44.6   18.1   37.2
+ 3    2D    1712.24   38.00     16742.44     55.03    43.5   20.4   36.1
+ 4    1D    1563.34   50.34     15130.04     54.42    44.3   18.2   37.5
+ 4    2D    1656.80   43.24     16135.64     55.48    43.0   20.7   36.2
+ 5    1D    1619.00   47.10     15719.00     54.67    44.0   19.0   37.0
+ 5    2D    1725.01   37.39     16876.23     55.99    42.4   22.4   35.1
+ 6    1D    1533.16   39.50     14936.68     54.82    43.9   18.1   38.0
+ 6    2D    1635.63   34.31     16013.17     56.02    42.6   20.1   37.4
+ 7    1D    1574.66   44.04     15306.26     54.66    44.1   17.7   38.2
+ 7    2D    1638.40   37.51     16008.98     55.31    43.3   19.9   36.8
+ 8    1D    1554.41   47.30     15071.11     55.53    43.2   18.7   38.1
+ 8    2D    1640.36   41.60     15987.67     56.32    42.3   20.6   37.1
+ 9    1D    1560.89   45.90     15149.98     53.02    45.7   17.5   36.9
+ 9    2D    1629.14   41.49     15876.57     54.50    44.1   19.4   36.5
+
+Score: 1D total loss < 2D total loss in 10/10 seeds. Not a single failure.
+
+Per-seed paired diffs (2D − 1D, total loss at λ=0.1)
+----------------------------------------------------
+   seed:  0      1     2      3      4      5      6     7     8     9
+   diff: +112.16 +89.46 +88.12 +108.75 +93.46 +106.01 +102.46 +63.74 +85.96 +68.25
+
+All ten differences are POSITIVE — 2D's loss is always higher than 1D's
+on the same seed. This is the same direction as the §20 5-seed result,
+just confirmed with twice the data.
+
+Aggregate (mean ± std across 10 seeds)
+======================================
+
+  metric                       1D                    2D            delta
+  --------------------------------------------------------------------------
+  Total loss (λ=0.1)          1561.52 ±  30.22     1653.35 ±  34.01    +91.83
+  Total slippage ($)            44.11 ±   3.66       37.74 ±   3.36     -6.37
+  Total adverse_move         15174.08 ± 282.47    16156.19 ± 337.91   +982.11
+  Fill rate                  54.344% ± 0.723%     55.478% ± 0.714%   +1.13pp
+
+Action mix (mean across 10 seeds)
+  WAIT         1D  44.38% ± 0.71      2D  43.07% ± 0.72        -1.31pp
+  PASSIVE      1D  18.21% ± 0.53      2D  20.55% ± 0.80        +2.34pp
+  AGGRESSIVE   1D  37.41% ± 0.58      2D  36.38% ± 0.67        -1.03pp
+
+Paired t-test (combined loss at λ=0.1)
+  mean diff = +91.84
+  std diff  = 16.38
+  t-stat    = +17.73  (n=10)
+  Interpretation: signal is ~18× the noise. Overwhelmingly significant.
+  For reference, |t| > 2 is "publishable significant"; |t|=17.73 is
+  beyond any reasonable doubt for this sample size.
+
+Compare to §15 (1D vs marginal):
+  §15 paired t-stat = -64.15, 10/10 seeds, 1D won.
+  §21 paired t-stat = +17.73, 10/10 seeds, 1D won AGAIN (now over 2D).
+  Signs are opposite because §15 reported (bucketed − marginal) and
+  here we report (2D − 1D), but in BOTH cases the pressure-bucketed
+  policy is the winner.
+
+Combined loss across the loss-tradeoff dial λ
+=============================================
+
+The table below sweeps the same data through different λ values to show
+where each policy wins and loses. Each row is the mean across 10 seeds.
+
+  λ      1D mean       1D std    2D mean       2D std    2D−1D       rel
+  ----------------------------------------------------------------------
+  0.00       44.11      3.66       37.74      3.36       -6.37    -14.45%   ← 2D WINS
+  0.05      802.81     16.24      845.54     17.28      +42.73     +5.32%
+  0.10     1561.52     30.22     1653.35     34.01      +91.84     +5.88%
+  0.25     3837.63     72.49     4076.78     84.60     +239.16     +6.23%
+  0.50     7631.15    143.07     8115.83    169.04     +484.68     +6.35%
+  1.00    15218.19    284.29    16193.93    337.98     +975.74     +6.41%
+
+(Negative "2D−1D" means 2D had lower loss, i.e. 2D wins.)
+
+Crossover point
+---------------
+2D wins at λ=0. 2D loses at λ=0.05 and above. The crossover lies between
+λ=0 and λ=0.05. We did not zoom in on the exact crossover; if needed,
+sweep λ in {0.005, 0.01, 0.02, 0.03, 0.04} on the same JSON file.
+
+
+WHAT HAPPENED — IN PLAIN LANGUAGE
+=================================
+
+The two policies are NOT making the same choices. 2D is taking more
+PASSIVE actions (+2.3pp average) and fewer WAITs and AGGRESSIVEs. That's
+the whole story behind every number in the tables.
+
+Why does posting more PASSIVE limit orders matter?
+
+1. PASSIVE earns the spread when it fills.
+   In our market spread is about $0.01 — half-spread is $0.005.
+   Every passive fill saves about $0.005 vs going AGGRESSIVE.
+   With ~6,000 passive fills per run, that's ~$30 of slippage saved.
+   2D fills ~700 more times than 1D and saves ~$6 more on net spread.
+
+2. PASSIVE fills are TOXIC.
+   "Toxic" means: when your limit gets filled, the price tends to move
+   AGAINST you right after. Why? Because most of the time your passive
+   order sits in the book waiting. The flow that crosses your limit and
+   fills it is, on average, the flow that has a reason to push the
+   price in that direction. So passive fills cluster right BEFORE
+   unfavorable moves. We saw this in §7 — adverse_move on passive was
+   2× the AGGRESSIVE one.
+
+3. The combined loss = slippage + λ * adverse_move.
+   The trade-off is "save spread by being patient, lose money on
+   bad-luck-after-fill." At λ=0 only the spread savings count and 2D
+   wins. At λ=0.1 the adverse term gets ten cents on the dollar, and
+   2D's extra ~1,000 adverse units cost 0.1 * 1,000 = ~$100 — way more
+   than the $6 spread saving.
+
+So 2D is being "smarter at filling" but it picks up MORE toxic flow as
+a side effect. At any λ above ~0.005 the toxicity bites harder than
+the savings reward.
+
+Why is 2D doing this?
+---------------------
+2D has 18 (pressure × regime) cells. 1D has 6 (pressure-only) cells.
+38,977 ticks divided by 18 ≈ 2,165 ticks per cell. Some corner cells
+are actually empty (heavy-buy AND heavy-sell extremes simultaneously).
+
+Hedge needs many updates per cell to converge to a clean preference.
+With only ~2,165 ticks per cell, the neutral-pressure cells in 2D
+don't push down PASSIVE as hard as the same neutral-pressure pressure
+bucket does in 1D (where it has ~6,500 ticks). So 2D ends up with a
+slightly higher PASSIVE weight in the cells where toxicity lives.
+
+Same data, more parameters to fit, less data per parameter, slower
+convergence per parameter, and the slow-converging parameters happen
+to favor an action that LOOKS good in slippage terms but has a hidden
+cost. Classic statistical trade.
+
+Did the regime split do ANYTHING useful?
+----------------------------------------
+Yes — at λ=0 it saved a real $6.37 vs 1D, with std $3.66 / sqrt(10)
+≈ 1.16, so the slippage-only win is paired-significant too. The regime
+information is real; it just happens to point the policy in a direction
+that hurts at the loss the project currently optimizes.
+
+If you were running a market-maker that hedged adverse risk separately
+on a different timescale, 2D would be the better policy. If you're
+optimizing the combined cost like we are here, 1D wins.
+
+Headline interpretation
+-----------------------
+1. The §15 thesis "state-conditioned > marginal" still holds. 1D
+   bucketed beats marginal by 29% (§15) AND beats 2D by 6% (§21).
+2. "More state dimensions = monotonically better" is FALSE. 2D loses
+   to 1D at the project's chosen λ even though it uses strictly more
+   information from the Kalman filter.
+3. The right framing is "find the policy at the right point on the
+   sample-size-vs-conditioning curve for your loss." 1D pressure-only
+   is that point on this data at λ=0.1.
+4. The result is robust: 10/10 seeds agree, paired t = +17.73.
+
+
+SUGGESTED FIGURES (numbers above are pre-arranged for these)
+============================================================
+
+A. Bar chart with error bars — combined loss at λ=0.1
+   x: {1D, 2D}
+   y: mean ± std from "Aggregate" block
+   message: 2D is consistently and significantly higher.
+
+B. Paired scatter — one dot per seed
+   x: 1D loss(seed)
+   y: 2D loss(seed)
+   reference line y=x.
+   All 10 dots are above y=x. Story-in-one-image.
+
+C. Slippage vs adverse trade-off — one dot per (seed, mode)
+   x: total slippage
+   y: total adverse_move
+   colour by mode.
+   Two clusters: 1D up-left, 2D down-right.
+   Caption: "2D pays less spread but takes more adverse risk."
+
+D. Lambda sweep — line chart
+   x: λ (0, 0.05, 0.1, 0.25, 0.5, 1.0)
+   y: 2D − 1D loss (the "imp" column, sign-flipped: positive = 2D worse)
+   reference line y=0.
+   Crossover near λ ≈ 0.005-0.05.
+   Caption: "2D wins on slippage, loses on combined cost."
+
+E. Action mix — grouped bar
+   x: action ∈ {WAIT, PASSIVE, AGGRESSIVE}
+   y: mean % across 10 seeds
+   one bar per mode.
+   Visual confirmation: 2D's bar is taller for PASSIVE, shorter for WAIT
+   and AGGRESSIVE.
+
+All raw numbers needed for these are in the per-seed table above and
+in data/derived/ab_2d_vs_1d_apr28_10seed.json.
+
+================================================================================
+ END OF §21 — 2026-04-28
+================================================================================
+
+
+================================================================================
+22. AUTOPILOT — LOCAL SCHEDULE FOR APR 28 → MAY 2
+================================================================================
+
+What this is
+------------
+Two scheduled jobs on the mac that turn the next four days of overnight
+ingest into LOTS of paired (1D vs 2D) data points instead of one.
+
+You keep doing the ingest part by hand (caffeinate + start ingest, leave
+it). The mac runs the analysis side automatically.
+
+The plan in caveman words
+-------------------------
+- Every 8 hours, the mac runs featuregen so features stay fresh.
+- Every morning at 9am, the mac runs featuregen one more time, then runs
+  BOTH 1D and 2D Hedge on EVERY 8-hour session in the data, with 5 seeds
+  each, paired by seed. All numbers go into one JSON file.
+
+By May 3 morning you should have:
+  ~12 new 8-hour sessions  (4 days × 3 sessions/day)
+  + 2 existing 10-hour sessions (Apr 21 + Apr 28)
+  = ~14 sessions × 5 seeds × 2 modes = ~140 rows
+  → enough data to plot the §21 result across many market windows
+    instead of one.
+
+The "fixed model" part
+----------------------
+Both modes use the SAME settings every run:
+  η               = 0.1
+  λ               = 0.1
+  pressure_edges  = [-0.5, -0.2, 0, 0.2, 0.5]      (6 buckets)
+  regime_edges    = [-0.3, +0.3]                    (3 buckets)
+  Kalman R, Q     = §16 post-fix values
+  obs_features    = depth_imbalance, ofi_l1, vol_30s
+  obs_center/scale= as in configs/kalman.yaml
+
+Same data, same configs, same seeds for both modes — only difference is
+the policy variant.
+
+Files added (no commits)
+------------------------
+  scripts/_scheduled_featuregen.sh       — bash wrapper, called by launchd
+  scripts/_scheduled_daily_ab.sh         — bash wrapper, calls daily_ab.py
+  scripts/_scheduled_daily_ab.py         — the actual A/B runner
+  ~/Library/LaunchAgents/com.damianmunoz.research.featuregen.plist
+  ~/Library/LaunchAgents/com.damianmunoz.research.daily-ab.plist
+
+Output
+------
+  data/derived/daily_ab/results.json     — single flat JSON, atomic
+                                            overwrite each morning
+                                            One row per (session × seed
+                                            × mode). Easy to load with
+                                            pandas.read_json().
+
+  data/logs/featuregen.log               — what the 8-hour featuregen did
+  data/logs/daily_ab.log                 — what the morning A/B did
+  data/logs/launchd_*.{stdout,stderr}.log — raw launchd output
+
+What ONE row in results.json looks like (caveman)
+-------------------------------------------------
+  {
+    "session_idx": 2,                ← which 8-hour chunk
+    "session_start_iso": "2026-04-28T03:12:50+00:00",
+    "session_n_rows": 38977,
+    "session_duration_h": 10.83,
+    "seed": 0,
+    "mode": "1D",                    ← or "2D"
+    "n_ticks": 38976,
+    "fill_rate": 0.51,
+    "total_slippage": 49.37,         ← $ paid above mid
+    "total_adverse":  13896.26,      ← bad-luck-after-fill (raw units)
+    "total_loss":     1438.99,       ← combined cost at λ=0.1
+    "wait_pct":       47.91,
+    "passive_pct":    14.67,
+    "aggressive_pct": 37.42
+  }
+
+Cadence (LOCAL TIME, America/Mexico_City)
+-----------------------------------------
+  featuregen:  fires at 00:00, 08:00, 16:00 every day
+  daily_ab:    fires at 09:00 every morning
+               (does featuregen one more time, then the A/B)
+
+Both jobs are idempotent — re-running them never breaks anything. Re-running
+daily_ab simply rewrites results.json with the latest snapshot of every
+session.
+
+How to TURN IT ON (one-time, run these once)
+============================================
+
+Open a terminal and paste:
+
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.damianmunoz.research.featuregen.plist
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.damianmunoz.research.daily-ab.plist
+
+That's it. Each "bootstrap" loads the plist and registers it with the
+mac's scheduler. They will fire at the next scheduled tick.
+
+To check they're loaded:
+  launchctl list | grep damianmunoz.research
+
+Expected output: two lines, one per Label. PID column is "-" when
+not currently running, a number when running.
+
+How to CHECK the schedule fired (anytime)
+=========================================
+  tail -50 data/logs/daily_ab.log
+  tail -50 data/logs/featuregen.log
+  ls -la data/derived/daily_ab/results.json
+  cat data/derived/daily_ab/results.json | python3 -m json.tool | head -50
+
+Or run it manually right now to confirm:
+  /bin/bash scripts/_scheduled_daily_ab.sh
+
+What to do about INGEST (the part launchd does NOT do)
+======================================================
+The launchd jobs only handle featuregen + A/B. The actual data has to
+keep coming from your machine. Start ingest yourself:
+
+  caffeinate -disu &                          # mac never sleeps
+  PYTHONPATH=. python scripts/1_ingest_ws.py  # leave this terminal open
+
+If ingest dies (Wi-Fi blip, laptop closed without caffeinate, etc.),
+restart it. The §5.1 self-heal will handle short gaps; longer gaps
+become new sessions automatically.
+
+How to TURN IT OFF (after May 2 night, or anytime)
+==================================================
+
+  launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.damianmunoz.research.featuregen.plist
+  launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.damianmunoz.research.daily-ab.plist
+
+Then verify:
+  launchctl list | grep damianmunoz.research      # should print nothing
+
+The plist files stay in ~/Library/LaunchAgents/ — bootout just unloads
+them. Re-bootstrap to turn back on. Delete the plist files to remove
+permanently.
+
+Smoke-tested? YES (2026-04-28 evening)
+--------------------------------------
+Both wrappers ran end-to-end before installing. Featuregen produced
+77,950 features. daily_ab.py wrote 20 rows (2 sessions × 5 seeds × 2
+modes) to data/derived/daily_ab/results.json. Logs landed in
+data/logs/. Numbers in results.json match §15 reference values for the
+old session (seed 0 1D bucketed → loss 1438.99 — exactly §15 row 1).
+
+So when 9am Apr 29 hits, the schedule should "just work" on whatever
+new data has accumulated by then.
+
+Suggested figures from results.json (when you have ~14 sessions)
+=================================================================
+
+A. Per-session paired box / strip plot
+   x: session_start_iso (one column per session, time-sorted)
+   y: total_loss
+   colour by mode (1D vs 2D)
+   Read: does the 2D-loses-by-X% pattern hold across all sessions?
+
+B. Per-session scatter
+   x: 1D mean loss across 5 seeds
+   y: 2D mean loss across 5 seeds
+   reference y=x line.
+   One dot per session. Story: do all dots stay above y=x?
+
+C. Slippage vs adverse cloud
+   x: total_slippage
+   y: total_adverse
+   one dot per (session, seed, mode), colour by mode.
+   Read: are 1D and 2D occupying different regions consistently?
+
+D. Time series of paired diff
+   x: session_start_iso
+   y: mean(2D_loss - 1D_loss) across seeds for that session
+   reference y=0
+   Read: is the diff stable over time, or does it drift?
+
+E. Total combined-loss saved vs always-AGGR baseline (per session)
+   needs always-AGGR baseline added to the script later — easy follow-up.
+
+================================================================================
+ END OF §22 — 2026-04-28
+================================================================================
+
+
+================================================================================
+23. THIRD OVERNIGHT — APR-30 17.66h SESSION, 10-SEED 1D vs 2D RERUN
+================================================================================
+
+WHAT THIS IS
+------------
+We let ingest run from Apr-29 evening through Apr-30 afternoon. Got the
+longest single session of the project so far: 17.66 hours, 63,590 feature
+rows. Ran the same paired 10-seed A/B from §21 (1D bucketed vs 2D
+bucketed, identical configs, paired by seed) on this fresh window.
+
+The point: does the §21 result ("1D wins on combined cost, 2D wins on
+slippage-only") still hold on a different day, twice the data, and a
+market that moved differently?
+
+Short answer: YES. Same direction, same magnitude per tick, much
+stronger statistical signal.
+
+
+SESSION TABLE (after featuregen on Apr-30 raw)
+==============================================
+script 6 detected 6 sessions:
+
+  idx  rows    hours  start                    end                       source
+   1   38973   10.83  2026-04-20 19:54:00 UTC  2026-04-21 06:43:32 UTC  (existing)
+   2   38977   10.83  2026-04-28 03:12:50 UTC  2026-04-28 14:02:31 UTC  (existing)
+   3   63590   17.66  2026-04-30 01:45:46 UTC  2026-04-30 19:25:35 UTC  (NEW, big)
+   4   73       0.01  2026-04-30 19:26:07 UTC  2026-04-30 19:26:48 UTC  (gap fragment, skip)
+   5   54       0.01  2026-04-30 19:26:59 UTC  2026-04-30 19:27:42 UTC  (gap fragment, skip)
+   6   7060     1.96  2026-04-30 19:47:19 UTC  2026-04-30 21:44:58 UTC  (NEW, post-gap)
+
+The Apr-30 raw stream had ONE WS hiccup at 19:43:33 UTC (skipped 473,057
+uids). The §5.1 self-heal reseeded from the 19:47:19 UTC snapshot
+(luid +102,498 ahead of the post-gap event). That self-heal interval
+shows up as the two tiny session fragments (idx 4 and 5) and the gap of
+~3 minutes between idx 3 and idx 6. Net: ~3 minutes of data lost around
+the gap, rest is correct.
+
+All §6 feature checks PASS on the 70,777 Apr-30 feature rows
+(0 violations on every test, sequence_gap=True 0/70,777).
+
+vol_30s nonzero in 91.07% of ticks. Matches §16's expectation of 91.47%.
+Max vol_30s on Apr-30 = 0.00251 — between Apr-21's 0.00031 (the calibration
+window) and Apr-28's 0.00565 spike. Less extreme regime spike than Apr-28.
+
+Session 3 is the focus of this entry.
+
+
+PROTOCOL (identical to §21 except n_ticks)
+==========================================
+- mode 1D = bucketed (pressure-only, 6 cells)
+- mode 2D = bucketed_2d (pressure × regime, 6 × 3 = 18 cells)
+- η = 0.1, λ = 0.1
+- pressure_edges = [-0.5, -0.2, 0, 0.2, 0.5]
+- regime_edges   = [-0.3, 0.3]
+- obs_features   = [depth_imbalance, ofi_l1, vol_30s] (post-§16)
+- 10 RNG seeds (0..9) × 2 modes = 20 replays on session 3
+- paired by seed
+- Output: data/derived/ab_session3_apr30_10seed.json
+
+
+PER-SEED RESULTS (session 3, λ=0.1)
+===================================
+
+  seed  mode      loss      slippage   adverse     fill%   W%    P%    A%
+  -------------------------------------------------------------------------
+   0    1D     2,486.60     82.89   24,037.07    52.74   46.0  15.0  39.0
+   0    2D     2,630.15     75.01   25,551.41    53.84   44.8  16.9  38.3
+   1    1D     2,563.50     84.34   24,791.64    53.70   45.0  15.7  39.2
+   1    2D     2,714.58     75.92   26,386.51    54.53   44.1  17.5  38.4
+   2    1D     2,471.08     90.43   23,806.58    53.67   45.1  14.4  40.5
+   2    2D     2,617.66     79.85   25,378.13    54.94   43.7  16.9  39.4
+   3    1D     2,488.05     88.25   23,998.02    53.30   45.5  14.6  39.9
+   3    2D     2,649.53     79.88   25,696.45    54.19   44.5  16.6  38.9
+   4    1D     2,462.33     85.18   23,771.54    53.38   45.4  15.0  39.6
+   4    2D     2,632.60     78.70   25,539.01    53.90   44.8  16.4  38.9
+   5    1D     2,506.18     82.46   24,237.24    53.19   45.6  15.5  38.9
+   5    2D     2,668.51     75.31   25,931.99    54.48   44.2  17.4  38.5
+   6    1D     2,481.26     84.16   23,970.98    52.89   45.9  14.9  39.2
+   6    2D     2,625.52     76.42   25,491.03    54.10   44.6  16.9  38.6
+   7    1D     2,491.84     89.41   24,024.28    52.58   46.2  14.1  39.7
+   7    2D     2,644.46     82.90   25,615.60    53.82   44.8  15.9  39.3
+   8    1D     2,503.45     83.77   24,196.84    52.58   46.1  15.3  38.5
+   8    2D     2,633.09     77.95   25,551.42    54.03   44.6  16.7  38.7
+   9    1D     2,546.47     86.71   24,597.65    52.51   46.3  14.5  39.2
+   9    2D     2,716.02     78.83   26,371.96    53.83   44.8  16.6  38.6
+
+1D wins on total loss in 10/10 seeds. Not a single failure.
+
+
+PER-SEED PAIRED DIFFERENCE  (2D − 1D, total loss at λ=0.1)
+==========================================================
+  seed:    0       1       2       3       4       5       6       7       8       9
+  diff: +143.55 +151.08 +146.58 +161.48 +170.27 +162.33 +144.26 +152.62 +129.63 +169.55
+
+  mean diff = +153.14
+  std       = 12.86
+  t-stat    = +37.67   (n=10)
+  Sign      = positive in 10/10 seeds → 2D's loss is always higher.
+
+For comparison §21 paired t was +17.73 over 10 seeds on Apr-28. Apr-30
+has roughly twice the ticks, so the cumulative paired diff cumulates twice
+as far while per-seed noise barely budges (std 16.38 → 12.86). Result:
+the t-stat doubles. Effect direction is identical.
+
+
+AGGREGATE (mean ± std across 10 seeds)
+======================================
+
+  metric                          1D                       2D                 delta
+  ----------------------------------------------------------------------------------
+  Total loss (λ=0.1)         2,500.08 ±   32.04      2,653.21 ±  35.63      +153.14
+  Total slippage ($)            85.76 ±    2.79         78.08 ±   2.47        -7.68
+  Total adverse_move        24,143.19 ±  327.67     25,751.35 ± 361.29    +1,608.17
+  Fill rate                   53.06% ± 0.46%          54.17% ± 0.38%        +1.11pp
+
+  Action mix
+    WAIT          1D  45.72% ± 0.45        2D  44.48% ± 0.39       -1.24pp
+    PASSIVE       1D  14.90% ± 0.51        2D  16.77% ± 0.47       +1.87pp
+    AGGRESSIVE    1D  39.38% ± 0.56        2D  38.75% ± 0.38       -0.63pp
+
+Same pattern as §21: 2D takes more PASSIVE (+1.87pp), takes less
+WAIT/AGGR, fills more (+1.11pp), pays less slippage (-$7.68), eats more
+adverse-move (+1,608 raw units). Combined cost is worse because the
+extra adverse > the saved slippage at λ=0.1.
+
+
+λ SWEEP — paired, mean across 10 seeds, total_loss = slippage + λ * adverse
+==========================================================================
+
+      λ      1D mean       1D std    2D mean      2D std     Δ(2D−1D)     rel    winner
+  --------------------------------------------------------------------------------------
+   0.000        85.76        2.79        78.08        2.47       -7.68    -8.96%    2D
+   0.005       206.47        2.78       206.83        2.70       +0.36    +0.17%    1D
+   0.010       327.19        3.61       335.59        3.87       +8.40    +2.57%    1D
+   0.025       689.34        7.82       721.86        8.79      +32.52    +4.72%    1D
+   0.050     1,292.92       15.77    1,365.64       17.65      +72.73    +5.63%    1D
+   0.100     2,500.08       32.04    2,653.21       35.63     +153.14    +6.13%    1D
+   0.250     6,121.55       81.12    6,515.91       89.78     +394.36    +6.44%    1D
+   0.500    12,157.35      163.02   12,953.75      180.08     +796.40    +6.55%    1D
+   1.000    24,228.94      326.84   25,829.43      360.72   +1,600.49    +6.61%    1D
+
+(Negative Δ means 2D has lower loss = 2D wins.)
+
+CROSSOVER between 2D-wins and 1D-wins lies between λ=0.000 and λ=0.005.
+On Apr-28 it was between 0 and 0.05. On Apr-30 it's tighter — roughly
+half a percent of the loss-tradeoff dial. Same shape, slightly less
+breathing room for 2D.
+
+
+SIDE-BY-SIDE WITH §21 (Apr-28) — PER-TICK NORMALISATION
+=======================================================
+The Apr-30 session is bigger, so total numbers are bigger by construction.
+Normalising to per-tick to compare fairly:
+
+  metric                             Apr-28        Apr-30      delta
+  ----------------------------------------------------------------------
+  ticks                              38,976        63,589
+  paired diff (2D − 1D, total)        +91.84       +153.14
+  paired diff / tick                  +0.002356    +0.002408   +2.2%
+  1D loss / tick                       0.04006      0.03932    -1.9%
+  2D loss / tick                       0.04242      0.04172    -1.6%
+  1D slip / tick ($)                   0.001132     0.001349  +19.2%
+  2D slip / tick ($)                   0.000968     0.001228  +26.9%
+  1D adv / tick                        0.3893       0.3797    -2.5%
+  2D adv / tick                        0.4145       0.4050    -2.3%
+  2D − 1D PASSIVE % shift             +2.34pp      +1.87pp
+  2D − 1D fill rate                   +0.0113      +0.0111
+
+The per-tick paired diff is 0.002356 vs 0.002408 — within 2.2% across the
+two sessions. The signal "2D is worse than 1D by ~$0.0024 of combined
+cost per tick at λ=0.1" reproduces almost identically on a different day.
+
+Slippage per tick is ~20-27% higher on Apr-30 than Apr-28. That's the
+spread environment: Apr-30 had a wider spread mean (0.0103 vs ~0.010 on
+Apr-28) and more spread blow-outs (max 2.14 vs 11.02 — Apr-30's tail
+was milder, but the body of the distribution was a touch wider). Both
+policies pay this equally. The relative 2D-vs-1D story is unchanged.
+
+
+PER-BUCKET FINAL WEIGHTS (script 6, single-seed=0 runs)
+========================================================
+
+1D bucketed (script 6, seed=0):
+  bucket  pressure range          visits   WAIT     PASSIVE   AGGR
+  ------------------------------------------------------------------
+  0       (-inf, -0.500]              43   0.3740   0.3351   0.2909   ← uniform (4 visits/learn)
+  1       (-0.500, -0.200]        16,479   0.8870   0.0504   0.0626   ← strong WAIT in seller pressure
+  2       (-0.200,  0.000]        17,212   0.6754   0.1384   0.1862
+  3       ( 0.000, +0.200]        16,309   0.3025   0.1751   0.5224
+  4       (+0.200, +0.500]        13,456   0.0823   0.1039   0.8138   ← strong AGGR in buyer pressure
+  5       (+0.500, +inf]              90   0.3369   0.3080   0.3551   ← near-uniform
+
+Buckets 0 and 5 still under-visited (43 and 90 ticks across 17.66h).
+Buckets 1-4 each got >13k ticks → very clean weight separation. Bucket 1
+went WAIT 0.89, bucket 4 went AGGR 0.81 — these are textbook
+state-conditioned policies.
+
+2D bucketed (script 6_2d, seed=0):
+  bucket  pressure              regime               visits  WAIT    PASS   AGGR
+  --------------------------------------------------------------------------------
+   0     (-inf, -0.500]         (-inf, -0.300]            0  0.333  0.333  0.333  empty
+   1     (-inf, -0.500]         (-0.300, +0.300]         42  0.365  0.351  0.284  ~uniform
+   2     (-inf, -0.500]         (+0.300, +inf]            1  0.341  0.318  0.341  ~uniform
+   3     (-0.500, -0.200]       (-inf, -0.300]        2,270  0.807  0.090  0.103
+   4     (-0.500, -0.200]       (-0.300, +0.300]     12,053  0.907  0.047  0.046  ← strongest WAIT
+   5     (-0.500, -0.200]       (+0.300, +inf]        2,156  0.801  0.102  0.098
+   6     (-0.200, +0.000]       (-inf, -0.300]        2,473  0.474  0.253  0.273
+   7     (-0.200, +0.000]       (-0.300, +0.300]     11,501  0.668  0.161  0.171
+   8     (-0.200, +0.000]       (+0.300, +inf]        3,238  0.640  0.134  0.227
+   9     (+0.000, +0.200]       (-inf, -0.300]        2,421  0.320  0.290  0.391
+  10     (+0.000, +0.200]       (-0.300, +0.300]     10,668  0.264  0.213  0.522
+  11     (+0.000, +0.200]       (+0.300, +inf]        3,220  0.323  0.148  0.530
+  12     (+0.200, +0.500]       (-inf, -0.300]        2,143  0.138  0.141  0.720
+  13     (+0.200, +0.500]       (-0.300, +0.300]      9,224  0.095  0.082  0.824
+  14     (+0.200, +0.500]       (+0.300, +inf]        2,089  0.058  0.080  0.862  ← strongest AGGR
+  15     (+0.500, +inf]         (-inf, -0.300]           29  ~uniform
+  16     (+0.500, +inf]         (-0.300, +0.300]         39  ~uniform
+  17     (+0.500, +inf]         (+0.300, +inf]           22  ~uniform
+
+GOOD NEWS for 2D: cell occupancy is materially better than Apr-28.
+On Apr-28 with 38k ticks, the 18 cells averaged ~2,165 ticks each and the
+extreme-pressure cells were nearly empty. On Apr-30 with 63k ticks, the
+12 inner cells (pressure ∈ [-0.5, +0.5], any regime) all have 2,000-12,000
+ticks. The under-visited cells are still the extreme-pressure tails
+(buckets 0/1/2 and 15/16/17 — pressure beyond ±0.5).
+
+So the §21 hypothesis "2D loses because of thin cells" is partially
+falsified on this data: cells are NO LONGER thin in the well-visited
+pressure region, and 2D STILL loses. The remaining hypothesis is that
+the regime split is genuinely informative for slippage (it points 2D
+toward more passive fills and saves spread) but those extra passive
+fills are toxic — they cluster before unfavorable price moves. The
+per-tick adverse-move difference is +0.0095 (2D minus 1D), about 2.5%
+worse adverse-per-tick on Apr-30, identical to Apr-28's +0.025. Same
+story: the regime-conditioned policy correctly identifies fill
+opportunities; those opportunities just happen to be the toxic ones.
+
+
+IN PLAIN LANGUAGE — WHAT HAPPENED AND WHY
+=========================================
+
+The two policies still make slightly different decisions. 2D takes a
+bit more passive (16.77% vs 14.90%) and a bit less wait/aggressive. Same
+direction as Tuesday. Same magnitude per tick.
+
+Why does this matter?
+  - PASSIVE earns the spread when it fills. Apr-30 spread was about
+    $0.01, half-spread $0.005. ~13,500 passive fills on 1D, ~10,650 on
+    1D — wait that's reversed — 2D fills more often (54.17% vs 53.06%
+    fill rate). Across 63k ticks at λ=0 (slippage only) 2D saves $7.68.
+
+  - PASSIVE fills are TOXIC. The flow that crosses your limit is the
+    flow that has a reason to push the price against you. So passive
+    fills cluster right before unfavorable moves. Apr-30 confirms this
+    again: 2D's passive-heavy mix collected +1,608 raw units of extra
+    adverse-move across the session. At λ=0.1 that's +$160.8 of
+    additional cost. Way more than the $7.68 spread saving.
+
+  - Net: 2D loses by $153.14 of combined cost per session at λ=0.1.
+
+Why doesn't more state help?
+  Apr-28 hypothesis was "2D's cells are too thin." Apr-30 makes the
+  inner cells fat (2k-12k ticks each) — and 2D STILL loses. So thin
+  cells were not the main driver. The remaining explanation: the
+  regime signal IS informative for fill quality, but the resulting
+  decision (more passive) is misaligned with our combined-cost
+  objective. The pressure dimension already captures the "act
+  asymmetrically based on imbalance" signal; the regime split adds
+  fine-grained tuning that pulls policy toward more passives, which
+  hurts at λ ≥ ~0.005.
+
+If we wanted 2D to win at our λ, we'd need a regime signal that
+correlates with FUTURE adverse-move risk, not just spread-fill
+opportunity. Different research project.
+
+Headline interpretation
+-----------------------
+1. The §15 thesis "state-conditioned > marginal" still holds with
+   another day of data. 1D bucketed remains the project's winning
+   policy.
+2. "More state = monotonically better" is FALSE. 1D beats 2D with 10/10
+   seeds on TWO independent sessions now (§21 Apr-28, §23 Apr-30).
+3. The 2D-loses-by-X% pattern is now a robust empirical regularity:
+   §21 Apr-28: 2D loses by +5.88% at λ=0.1
+   §23 Apr-30: 2D loses by +6.13% at λ=0.1
+   Spread of ~0.25pp across two very different sessions and roughly
+   twice the data on Apr-30.
+4. Statistical significance went from |t| = 17.73 to |t| = 37.67. With
+   the §21 result, this is now beyond any reasonable sampling-noise
+   doubt for this generative process at this configuration.
+
+
+SUGGESTED FIGURES (numbers above are pre-arranged for these)
+============================================================
+
+A. Bar chart with error bars — combined loss at λ=0.1, session 3
+   x: {1D, 2D}, y: mean ± std (use 2,500.08 ± 32.04 vs 2,653.21 ± 35.63).
+
+B. Paired scatter — one dot per seed
+   x: 1D loss(seed), y: 2D loss(seed), reference y=x.
+   All 10 dots above y=x.
+
+C. Slippage vs adverse trade-off — one dot per (seed, mode)
+   x: total_slippage, y: total_adverse, colour by mode.
+   1D up-left, 2D down-right (same as §21).
+
+D. λ sweep line chart
+   x: λ ∈ {0, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0}
+   y: Δ(2D − 1D) loss, reference y=0.
+   Crossover near λ ≈ 0.005.
+
+E. Action mix grouped bar
+   x: action ∈ {WAIT, PASSIVE, AGGR}, y: mean % across 10 seeds.
+   2D's PASSIVE bar is taller, others shorter.
+
+F. Per-tick paired diff stability across sessions
+   x: session ∈ {Apr-28, Apr-30}, y: paired diff per tick (0.00236, 0.00241)
+   Caption: "Same effect size, different days."
+
+G. Bucket occupancy — heatmap (only for 2D)
+   x: pressure bucket index, y: regime bucket index, colour: visits.
+   Visual confirmation that Apr-30 fills the inner 12 cells, leaves the
+   pressure tails empty.
+
+All raw numbers needed for these are in the per-seed table above and in
+data/derived/ab_session3_apr30_10seed.json.
+
+
+WHAT WE HAVE NOW (cumulative state of the evidence)
+===================================================
+
+  source         session     ticks    pairs   |t|     direction        rel
+  ------------------------------------------------------------------------
+  §15            Apr-21      38,972   10      64.15   1D > marginal    +29%
+  §21            Apr-28      38,976   10      17.73   1D > 2D          +5.88%
+  §23            Apr-30      63,589   10      37.67   1D > 2D          +6.13%
+
+The 1D-bucketed-pressure-only policy is the project's winning policy
+across three independent overnight sessions, two different "competitor"
+policies (marginal and 2D), and 30 paired seed comparisons total. We
+are no longer running this on a single window.
+
+================================================================================
+ END OF §23 — 2026-04-30
+================================================================================
+
+
+================================================================================
+24. ADVERSE-TARGETED 2D — TRYING TO PICK THE REGIME OFF THE FLOOR (2026-04-30)
+================================================================================
+
+WHY THIS EXPERIMENT EXISTS
+==========================
+§21 and §23 both showed the same thing on different days: the 2D
+bucketed policy (pressure × Kalman regime) takes more passive fills,
+saves a little slippage, but eats a lot more adverse_move and loses on
+combined cost.
+
+The diagnosis from §23: the Kalman regime axis is informative — but it
+predicts FILL PROBABILITY, not ADVERSE-MOVE RISK. It tells the policy
+"hey there are gaps to walk through" instead of "hey, walking now will
+get you hit." So 2D used true information to make the wrong decision
+for our cost.
+
+§24 is the test of the obvious next idea: REPLACE the regime axis with
+a signal designed to predict adverse risk specifically. Three candidate
+signals (each computed inline from raw features over a rolling 60s
+window):
+
+  vol_delta     vol_30s_now − vol_30s_(now−60s)
+                positive ⇒ volatility is *rising* (instead of "high")
+  ofi_window    sum of ofi_l1 over the trailing 60s
+                positive ⇒ sustained net buy pressure
+                negative ⇒ sustained net sell pressure
+  spread_delta  spread_abs_now − spread_abs_(now−60s)
+                positive ⇒ spread is widening (a "things-getting-weird"
+                signal)
+
+The wager: if any of these correlates with adverse_move-after-fill
+(rather than fill probability), then a 2D split on (pressure, signal)
+might actually beat 1D on combined cost.
+
+
+ARTIFACTS CREATED FOR §24 — every new file, what it does, how it differs
+========================================================================
+None of the existing 1D / 2D scripts, configs, or src/policy/hedge.py
+were modified. All §24 work lives in sibling files. The four artifacts:
+
+  1. src/features/adverse_signals.py        (NEW)
+  2. src/policy/hedge_adverse.py            (NEW)
+  3. scripts/6_simulate_and_update_adverse.py (NEW)
+  4. scripts/_ab_adverse_3sessions.py       (NEW)
+  5. data/derived/execution_log_adverse/    (NEW directory)
+  6. data/derived/ab_adverse_3sessions_10seed.json  (NEW)
+
+----------------------------------------------------------------------
+1. src/features/adverse_signals.py
+----------------------------------------------------------------------
+Three small stateful classes for rolling-window second-axis signals.
+
+Public interface (all three classes share it):
+    sig = SignalClass(window_sec=60.0)
+    value = sig.update(ts_ms, scalar_input)
+
+Each one keeps a deque of (ts_ms, value) tuples, trims old entries
+older than `now − window_sec`, and returns:
+  - RollingVolDelta:    current_value − oldest_inside_window
+  - RollingSpreadDelta: same as VolDelta but on spread_abs
+  - RollingOFINetFlow:  running SUM of values inside the window
+
+Warmup: until the buffer covers a full window (typically the first 60s
+of a session) update() returns 0.0 — a neutral signal that buckets
+treat as "no information yet."
+
+A small registry maps the signal name to (class, raw_feature_to_read,
+human_label):
+    SIGNAL_REGISTRY = {
+        "vol_delta":    (RollingVolDelta,    "vol_30s",    "vol_30s rising"),
+        "ofi_window":   (RollingOFINetFlow,  "ofi_l1",     "60s net OFI"),
+        "spread_delta": (RollingSpreadDelta, "spread_abs", "spread widening"),
+    }
+
+This file does NOT modify the FeaturePipeline or its parquet schema.
+Signals are computed inline by the runner / A/B harness from raw feature
+columns, so the canonical features parquet stays stable and the existing
+1D / 2D scripts keep producing the same numbers.
+
+How it differs from the existing src/features/volatility.py:
+  RollingVolatility (existing) computes log-return realized volatility
+  at three nested windows (1s, 5s, 30s) from mid-price ticks. Output is
+  always a magnitude (>=0).
+  The §24 signals are SIGNED differences over a single window, designed
+  to capture *direction of change* rather than *level of volatility*.
+
+----------------------------------------------------------------------
+2. src/policy/hedge_adverse.py
+----------------------------------------------------------------------
+A NEW policy class plus a NEW context dataclass.
+
+Why a new file (instead of repurposing BucketedHedge2DPolicy):
+  BucketedHedge2DPolicy is wired to read `ctx.regime` from PolicyContext.
+  That field semantically means "the Kalman filter's regime estimate."
+  Reusing it for an unrelated rolling-window signal would be misleading
+  AND would couple two unrelated experiments through a single field.
+  Cleaner: introduce parallel types whose names are honest.
+
+Two new types:
+
+  class AdverseContext:
+      ts_ms:           int
+      market_pressure: float   # primary axis (same as before)
+      secondary:       float   # the adverse-targeted signal (NOT regime)
+
+  class BucketedHedgeAdversePolicy:
+      def __init__(
+          self,
+          pressure_edges:  List[float],     # primary axis edges
+          secondary_edges: List[float],     # NEW axis edges (per signal)
+          learning_rate:   float,
+          initial_weight:  float = 1.0,
+          secondary_label: str   = "secondary",
+          seed:            Optional[int] = None,
+      ): ...
+
+      def select(ctx: AdverseContext) -> PolicyDecision: ...
+      def update(action: Action, loss: float) -> None:    ...
+      def weights() -> Dict[Action, float]:               ...
+      def bucket_summary() -> List[Dict]:                 ...
+
+Mathematically identical to BucketedHedge2DPolicy: classical Hedge per
+cell, multiplicative weights update, no shared state across cells.
+The ONLY differences from BucketedHedge2DPolicy:
+  - takes constructor args directly (no PolicyConfig wrapping)
+  - second axis is `secondary` (not `regime`)
+  - bucket_summary() emits 's_range' (not 'r_range') and includes the
+    s_label so logs identify which signal was bucketed on
+
+Reuses HedgePolicy.PolicyDecision verbatim — the output schema does
+not change, so anything reading the per-tick decision log keeps working.
+
+----------------------------------------------------------------------
+3. scripts/6_simulate_and_update_adverse.py
+----------------------------------------------------------------------
+A sibling of scripts/6_simulate_and_update.py and
+scripts/6_simulate_and_update_2d.py. Same:
+  - session detection (5s time-gap split, identical logic)
+  - Kalman filter
+  - simulator + loss
+  - --session N / --list-sessions / --seed S CLI flags
+
+What's different:
+  - new --signal {vol_delta, ofi_window, spread_delta} flag (required)
+    selects which adverse signal to use as the second axis
+  - new --window-sec flag (default 60.0)
+  - new --list-signals flag
+  - replay loop is INLINE (does NOT call src/execution/updater.run)
+    because updater.run only knows about PolicyContext, not
+    AdverseContext. The inline loop is otherwise identical:
+       Kalman → secondary_signal.update() → AdverseContext →
+       policy.select → simulate_fill → compute_loss → policy.update
+  - writes to a SEPARATE execution log dir
+       data/derived/execution_log_adverse/run=<UTC-stamp>/
+    so it does NOT collide with the canonical 1D/2D execution log
+  - the per-tick log carries TWO extra fields:
+       secondary       — the actual signal value bucketed on
+       signal_name     — which signal generated `secondary`
+    so post-hoc analysis can correlate signal value with adverse_move
+    realized at the same tick
+
+Default secondary-axis bucket edges are calibrated from pooled p33/p66
+across the three real sessions on disk:
+       vol_delta    [-1.1e-5, +9.0e-6]   3 buckets
+       ofi_window   [-2.0,    +1.9]      3 buckets
+       spread_delta [0.0]                2 buckets (more on this below)
+
+Why spread_delta uses a single edge: the rolling 60s spread_delta is
+≈ 0 for >99% of ticks in this market (BTCUSDT spread is almost always
+exactly 1 tick = $0.01; rare widening events are sparse outliers).
+Quantile-based edges degenerate (p33 = p66 = 0.0). A single edge at 0.0
+asks the binary question "did the spread widen at all in the last 60s?"
+
+----------------------------------------------------------------------
+4. scripts/_ab_adverse_3sessions.py
+----------------------------------------------------------------------
+The §24 A/B harness. Internal script — like the existing
+scripts/_scheduled_daily_ab.py and scripts/_ab_session3_10seed.py. Not
+called by launchd, just `python` invocation when we want to run the
+experiment.
+
+What it does:
+  For each of TARGET_SESSIONS = [1, 2, 3] (the 3 real sessions; skips
+  the tiny gap fragments idx 4/5 and the small post-gap session 6),
+  for each seed in [0..9], runs FOUR policies on the same data:
+    1. 1D bucketed (canonical baseline — current winner)
+    2. adverse-2D with secondary = vol_delta
+    3. adverse-2D with secondary = ofi_window
+    4. adverse-2D with secondary = spread_delta
+  Identical config across all four (same η, λ, pressure_edges, same
+  Kalman filter). Total runs = 3 × 10 × 4 = 120.
+
+Output:
+  data/derived/ab_adverse_3sessions_10seed.json
+  Flat list of 120 records, one per (session_idx × seed × mode).
+  Each record carries session metadata + per-run metrics + (for
+  adverse modes) the secondary_edges used.
+
+Key design decisions:
+  - 1D baseline is recomputed (not loaded from §15/§21/§23 JSONs) so
+    the comparison uses identical Kalman state initialization and seed
+    handling as the adverse runs. Sanity-checked: our 1D baseline mean
+    matches §15 (1415.30), §21 (1561.52), §23 (2500.08) EXACTLY across
+    all three sessions.
+  - Each (seed, mode) gets a fresh KalmanFilter and fresh policy. No
+    state leakage between runs.
+  - logging.disable(CRITICAL) at module import so the per-tick INFOs
+    from src.* don't flood the log; only the harness's own progress
+    prints survive.
+
+How it differs from scripts/_scheduled_daily_ab.py:
+  - daily_ab runs 1D vs 2D (Kalman regime), 5 seeds, ALL sessions
+  - this harness runs 1D vs THREE adverse signals, 10 seeds, only the
+    3 real sessions, with the new BucketedHedgeAdversePolicy
+
+----------------------------------------------------------------------
+5. data/derived/execution_log_adverse/
+----------------------------------------------------------------------
+New top-level directory parallel to execution_log/. Same `run=<UTC>` /
+`date=<YYYY-MM-DD>` / `log.jsonl` / `latest` symlink layout as the
+canonical execution_log. Kept separate so:
+  - the canonical 1D / 2D logs stay clean (their schema is
+    ExecutionRecord; the adverse log is AdverseExecutionRecord and
+    has 2 extra columns)
+  - existing tooling that reads execution_log/latest/ keeps working
+
+
+CALIBRATION OF SECONDARY-AXIS BUCKET EDGES
+==========================================
+Before running the A/B we scanned all feature data, replayed each
+session with the three signal classes, and computed quantiles to pick
+edges that give roughly equal-population buckets.
+
+Distribution summary (pooled across 141,358 ticks of all 3 sessions):
+
+  signal         mean        p25         p33         p50         p66         p75         p99
+  --------------------------------------------------------------------------------------------
+  vol_delta     -1e-6       -1.6e-5     -1.1e-5    +0.0e+0     +9e-6      +1.6e-5    +9.2e-5
+  ofi_window    +0.001      -3.07       -1.98      -0.00       +1.87      +3.06     +12.14
+  spread_delta  -0.0002      0.0         0.0        0.0         0.0        0.0        0.0
+
+vol_delta is well-distributed but TINY in magnitude. Edges chosen at
+p33/p66 give 3 roughly-equal buckets (≈33% / 33% / 33% of ticks).
+
+ofi_window is well-distributed and big enough to bucket cleanly. Edges
+at p33/p66 give 3 balanced buckets (cooling sell flow / balanced /
+cooling buy flow over the last minute).
+
+spread_delta is degenerate for quantile bucketing — the spread doesn't
+change in 60s windows for the vast majority of ticks. Single-edge at 0
+asks "did the spread widen at all in the trailing 60s?" Captures the
+asymmetric "things-getting-weird" hypothesis cleanly.
+
+
+PROTOCOL (identical to §15, §21, §23 except for the policy variants)
+====================================================================
+  η = 0.1
+  λ = 0.1
+  pressure_edges = [-0.5, -0.2, 0.0, 0.2, 0.5]   (6 buckets)
+  secondary_edges per signal: see above
+  obs_features = [depth_imbalance, ofi_l1, vol_30s] (post-§16)
+  10 seeds (0..9) × 3 sessions × 4 modes = 120 runs
+  Total wall-clock ≈ 125s.
+
+
+BASELINE-REPRODUCTION SANITY CHECK — passes
+===========================================
+The 1D bucketed baseline is the same code path used in §15, §21, §23,
+fed the same way. Results should be IDENTICAL. They are:
+
+  session  reference         ref mean     our mean   match
+  --------------------------------------------------------
+  Apr-21   §15 (this file)   1,415.30     1,415.30   exact
+  Apr-28   §21 (this file)   1,561.52     1,561.52   exact
+  Apr-30   §23 (this file)   2,500.08     2,500.08   exact
+
+Confirms: the new harness composes Kalman + 1D bucketed identically to
+the existing scripts. Any difference between 1D and the adverse modes
+in this run is attributable to the policy variant alone.
+
+
+HEADLINE RESULT
+===============
+
+  signal vs 1D baseline       Apr-21 (38k)    Apr-28 (38k)    Apr-30 (64k)
+  ---------------------------------------------------------------------------
+  vol_delta                   loses 0/10      loses 0/10      loses 0/10
+  ofi_window                  loses 2/10      loses 1/10      WINS  8/10  ←
+  spread_delta                loses 0/10      loses 0/10      loses 0/10
+
+  signal at λ=0.1            paired diff       |t|       per-tick effect
+  ----------------------------------------------------------------------
+  Apr-21  vol_delta         +133.51 ± 14.62   28.89    +0.003426  loses
+  Apr-21  ofi_window         +15.31 ± 16.29    2.97    +0.000393  loses (barely)
+  Apr-21  spread_delta       +68.07 ± 17.01   12.65    +0.001747  loses
+  Apr-28  vol_delta         +115.50 ± 10.52   34.73    +0.002963  loses
+  Apr-28  ofi_window         +19.97 ± 11.59    5.45    +0.000512  loses (barely)
+  Apr-28  spread_delta       +51.93 ± 13.46   12.20    +0.001332  loses
+  Apr-30  vol_delta         +168.87 ± 15.38   34.72    +0.002656  loses
+  Apr-30  ofi_window          -9.79 ± 13.05    2.37    -0.000154  WINS  ← FIRST EVER
+  Apr-30  spread_delta       +90.81 ± 10.08   28.48    +0.001428  loses
+
+ofi_window on Apr-30 is the first 2D-style policy to beat 1D bucketed
+at λ=0.1 in any session of this project. Margin is small (~0.4%) but
+8 of 10 seeds independently agree. |t| = 2.37 — at the edge of
+conventional significance for n=10 paired observations, but a real
+positive signal nonetheless.
+
+
+PER-SESSION × PER-MODE AGGREGATES (mean across 10 seeds)
+========================================================
+
+--- Apr-21 (38,972 ticks) ---
+  mode             loss        slip       adv          fill%   W%      P%      A%
+  -----------------------------------------------------------------------------
+  1D_baseline      1,415.30    48.74      13,665.65    53.49   45.36   16.16   38.48
+  vol_delta        1,548.81    42.65      15,061.59    55.16   43.54   18.69   37.78
+  ofi_window       1,430.61    44.48      13,861.36    54.05   44.75   17.58   37.68
+  spread_delta     1,483.37    45.77      14,375.98    54.36   44.41   17.46   38.12
+
+--- Apr-28 (38,976 ticks) ---
+  mode             loss        slip       adv          fill%   W%      P%      A%
+  -----------------------------------------------------------------------------
+  1D_baseline      1,561.52    44.11      15,174.08    54.34   44.38   18.21   37.41
+  vol_delta        1,677.02    35.34      16,416.80    56.04   42.49   21.23   36.28
+  ofi_window       1,581.48    39.03      15,424.58    55.73   42.86   20.21   36.94
+  spread_delta     1,613.44    41.76      15,716.87    54.98   43.65   19.27   37.07
+
+--- Apr-30 (63,589 ticks) ---
+  mode             loss        slip       adv          fill%   W%      P%      A%
+  -----------------------------------------------------------------------------
+  1D_baseline      2,500.08    85.76      24,143.19    53.06   45.72   14.90   39.38
+  vol_delta        2,668.95    79.61      25,893.39    53.91   44.72   16.39   38.89
+  ofi_window       2,490.29    82.92      24,073.72    53.91   44.83   15.69   39.49
+  spread_delta     2,590.89    82.27      25,086.17    53.43   45.26   15.72   39.02
+
+
+PER-SEED PAIRED DIFFS (signal_loss − 1D_baseline_loss)
+======================================================
+
+--- Apr-21 ---
+  seed   1D loss     vol_delta    ofi_window   spread_delta
+   0     1,438.99    +116.18      -1.28        +59.35
+   1     1,415.54    +130.13      +8.52        +69.22
+   2     1,410.02    +138.05      +7.83        +63.97
+   3     1,386.16    +122.84      +10.34       +71.39
+   4     1,438.15    +111.14      -8.62        +26.11
+   5     1,403.10    +142.20      +41.66       +78.19
+   6     1,441.05    +142.73      +27.63       +89.40
+   7     1,391.72    +139.67      +21.71       +67.83
+   8     1,397.58    +161.27      +8.17        +77.37
+   9     1,430.71    +130.87      +37.14       +77.83
+
+--- Apr-28 ---
+  seed   1D loss     vol_delta    ofi_window   spread_delta
+   0     1,513.34    +131.34      +22.86       +73.66
+   1     1,535.11    +113.73      +12.34       +28.53
+   2     1,557.76    +119.27       -7.25       +44.27
+   3     1,603.49    +101.94      +37.46       +51.64
+   4     1,563.34    +130.85      +25.55       +62.54
+   5     1,619.00    +104.37      +19.29       +58.17
+   6     1,533.16    +113.69      +24.29       +61.87
+   7     1,574.66    +122.22      +23.90       +57.65
+   8     1,554.41    +113.56      +16.80       +38.68
+   9     1,560.89    +104.04      +24.44       +42.25
+
+--- Apr-30 ---
+  seed   1D loss     vol_delta    ofi_window   spread_delta
+   0     2,486.60    +156.56       -7.06       +76.73
+   1     2,563.50    +143.86       -8.71       +82.31
+   2     2,471.08    +177.29       -1.26       +109.93
+   3     2,488.05    +180.80      -19.97       +90.56
+   4     2,462.33    +173.39       +8.30       +92.50
+   5     2,506.18    +180.94       -5.67       +99.30
+   6     2,481.26    +170.49       -4.38       +87.91
+   7     2,491.84    +171.85      -24.37       +94.32
+   8     2,503.45    +144.95      -35.38       +78.39
+   9     2,546.47    +188.61       +0.62       +96.17
+
+
+ofi_window MECHANISM — slippage AND adverse_move both drop on Apr-30
+====================================================================
+The crossover λ analysis tells us where each policy's slippage save
+trades off against its adverse-move cost:
+
+   ofi_window vs 1D_baseline:
+     session   Δslip       Δadv         crossover λ
+     ------------------------------------------------
+     Apr-21    -4.26       +195.71      +0.0218     ofi wins only at λ < 0.022
+     Apr-28    -5.08       +250.50      +0.0203     ofi wins only at λ < 0.020
+     Apr-30    -2.84       -69.47       -0.0409     ofi wins at EVERY λ ≥ 0
+
+   vol_delta vs 1D_baseline (for comparison — classic toxic pattern):
+     Apr-30    -6.15       +1750.20     +0.0035     wins only at very low λ
+   spread_delta vs 1D_baseline:
+     Apr-30    -3.49       +942.98      +0.0037     wins only at very low λ
+
+ON APR-21 AND APR-28, ofi_window has the SAME failure mode as the
+Kalman regime in §21/§23: saves slippage, EATS more adverse, loses
+above some small λ. Just like 2D regime did.
+
+ON APR-30, ofi_window saves BOTH slippage (-$2.84) AND adverse-move
+(-69 raw units = -$6.95 at λ=0.1). Strict Pareto improvement over 1D.
+There is no λ ≥ 0 where 1D wins.
+
+This is the ONLY case in the project's history where a 2D-style
+policy strictly dominates 1D on the same data.
+
+
+λ SWEEP — where each signal wins / loses
+========================================
+
+--- Apr-21 (Δ vs 1D, "W" = signal wins) ---
+        λ      1D_baseline   vol_delta    ofi_window   spread_delta
+   0.000           48.74     -6.09 W      -4.26 W      -2.97 W
+   0.005          117.07     +0.89        -3.29 W      +0.58
+   0.010          185.40     +7.87        -2.31 W      +4.13
+   0.025          390.38    +28.81        +0.63        +14.79
+   0.050          732.02    +63.71        +5.53        +32.55
+   0.100        1,415.30   +133.51       +15.31        +68.07
+   0.250        3,465.15   +342.90       +44.67       +174.62
+   0.500        6,881.56   +691.89       +93.60       +352.20
+
+--- Apr-28 (Δ vs 1D) ---
+        λ      1D_baseline   vol_delta    ofi_window   spread_delta
+   0.000           44.11     -8.77 W      -5.08 W      -2.35 W
+   0.005          119.98     -2.56 W      -3.83 W      +0.36
+   0.010          195.85     +3.66        -2.58 W      +3.07
+   0.025          423.46    +22.30        +1.18       +11.22
+   0.050          802.81    +53.37        +7.44       +24.79
+   0.100        1,561.52   +115.50       +19.96       +51.93
+   0.250        3,837.63   +301.91       +57.54       +133.34
+   0.500        7,631.15   +612.59      +120.16       +269.04
+
+--- Apr-30 (Δ vs 1D) ---
+        λ      1D_baseline   vol_delta    ofi_window   spread_delta
+   0.000           85.76     -6.15 W      -2.84 W      -3.49 W
+   0.005          206.47     +2.61        -3.18 W      +1.22
+   0.010          327.19    +11.35        -3.53 W      +5.94
+   0.025          689.34    +37.61        -4.58 W      +20.08
+   0.050        1,292.92    +81.36        -6.32 W      +43.66
+   0.100        2,500.08   +168.87        -9.79 W      +90.81
+   0.250        6,121.55   +431.41       -20.20 W     +232.26
+   0.500       12,157.35   +868.95       -37.57 W     +468.00
+
+Apr-30 ofi_window dominates 1D at every λ tested. The Δ even GROWS
+(in the favorable direction) as λ increases, because higher λ rewards
+the adverse-move savings that ofi_window uniquely delivers on this
+session.
+
+
+IN PLAIN LANGUAGE — WHAT JUST HAPPENED
+======================================
+
+We tried THREE different "second axes" beyond pressure. The hypothesis
+was: maybe the §21/§23 result wasn't "more dimensions hurts" but "the
+Kalman regime axis is the wrong second dimension." If we picked one
+that's actually about adverse risk instead of fill probability, the 2D
+policy might win.
+
+Two of three signals (vol_delta, spread_delta) FAILED in the same way
+as the Kalman regime: more passive fills, more adverse hits, net loss.
+Same toxic-flow story. So those two are off the table.
+
+ONE signal (ofi_window) SHOWED MIXED EVIDENCE:
+  - On the two smaller sessions (Apr-21, Apr-28, ~38k ticks each), it
+    behaves like the others — saves a little slippage, eats a little
+    extra adverse, loses on net at λ=0.1.
+  - On the bigger session (Apr-30, ~64k ticks), it strictly dominates.
+    Saves BOTH slippage and adverse-move. Wins 8/10 seeds. Wins at
+    every λ from 0 to 0.5.
+
+So we DID pick something off the floor — but only on one session, and
+only with ~40 minutes more data than the smaller sessions had.
+
+Why would the same signal flip from "loses by a little" to "wins
+strictly" with more data?
+  - Hypothesis A — sample size: 60s of 1s ticks is a long window. With
+    only 38k ticks, the policy has fewer chances to accumulate
+    statistically meaningful evidence per (pressure × ofi_window) cell.
+    With 64k ticks the cells get enough data to learn the right pattern.
+    If true, Apr-21/28 would win too if they had 64k ticks.
+  - Hypothesis B — market character: Apr-30 had a distinct character
+    (longer span, different volatility profile, different price range).
+    The (pressure × cumulative_ofi) split might be informative
+    specifically when there are multiple multi-hour trends in one
+    session — which Apr-30 had and Apr-21/28 did not.
+  - Hypothesis C — luck: 8/10 wins with |t|=2.37 is at the edge of
+    "publishable significant." A second 64k+ session might or might
+    not reproduce it.
+
+WE CANNOT DISAMBIGUATE A vs B vs C with the data we have. The
+straightforward way to find out is one more clean overnight session of
+≥ 17h, then re-run the §24 A/B on it.
+
+vol_delta and spread_delta are NOT the right axes for this project.
+The mechanism in both is the same as the Kalman regime: they predict
+when fills are easy, not when fills are toxic. They join the regime
+field on the "informative for the wrong question" pile.
+
+
+HEADLINE INTERPRETATION
+=======================
+1. The §15 thesis "1D state-conditioned > marginal" still stands.
+   1D is still the winner across 3 sessions and now 4 different
+   competitors (marginal, 2D regime, vol_delta, spread_delta).
+2. ofi_window is the FIRST 2D variant to ever beat 1D on combined cost
+   in any single session. The win is small (~0.4%, |t|=2.37) and only
+   happens on the largest session, but the mechanism is qualitatively
+   different from every previous 2D attempt: it saves both slippage
+   AND adverse_move on Apr-30 instead of trading one for the other.
+3. The §23 hypothesis "the Kalman regime axis predicts fill
+   probability, not adverse risk" is now empirically grounded:
+   - vol_delta and spread_delta have the same failure mode (fill-quality
+     signal, fail at adverse).
+   - ofi_window has a partially different failure mode (sometimes works,
+     sometimes doesn't). Suggests the sustained net flow over a minute
+     captures something about *direction of the next move* that the
+     other two signals don't.
+4. We do not yet have enough evidence to say "ofi_window 2D > 1D in
+   general." We have evidence for "ofi_window 2D > 1D on Apr-30
+   specifically." That is qualitatively new.
+
+
+WHAT TO DO NEXT
+===============
+1. ✅ Keep 1D as the production default. Nothing here moves us off 1D.
+
+2. ✅ Run another long (>15h) overnight session and re-run the §24 A/B
+   on it. This is the cheapest way to test hypotheses A vs B vs C from
+   above. If ofi_window wins on a second long session at |t| ≥ 2, that
+   is real generalization. If it loses, the Apr-30 win was either
+   luck or session-character-specific.
+
+3. ⚠ Consider a 6×2 (instead of 6×3) ofi_window split. With binary
+   "net buying / net selling" instead of trinary "selling / balanced /
+   buying", each cell gets 50% more data. Cheap to try (one config
+   change). Plausibly reduces noise on the smaller sessions where
+   ofi_window currently loses.
+
+4. ⚠ Try slightly higher η for ofi_window specifically (0.15 or 0.2).
+   The signal is positive on Apr-30 with default η=0.1; faster learning
+   per cell might help the smaller sessions accumulate the same
+   evidence in fewer ticks.
+
+5. ❌ Skip vol_delta as the second axis. Three sessions, all losses,
+   all same mechanism. The signal IS informative — but for fill
+   probability, same as the Kalman regime. Adds nothing new.
+
+6. ❌ Skip spread_delta as the second axis. Same reason as vol_delta.
+   Spread-widening is a fill-easy signal in this market, not an
+   adverse-risk signal.
+
+
+SUGGESTED FIGURES (numbers above are pre-arranged)
+==================================================
+
+A. Per-session bar chart with error bars, paired-by-mode
+   x: 4 modes per session, faceted by session
+   y: total_loss mean ± std across 10 seeds
+   reference line: 1D_baseline mean per session
+   message: ofi_window touches the 1D line on Apr-30; bars otherwise above.
+
+B. Per-seed paired scatter, ofi_window vs 1D, by session
+   x: 1D_baseline loss(seed)
+   y: ofi_window loss(seed)
+   reference y=x; one panel per session
+   Apr-21/28 panels: dots above y=x. Apr-30 panel: 8 of 10 dots BELOW.
+
+C. Δslip vs Δadv scatter (one dot per session × signal)
+   x: ofi_window total_slippage − 1D total_slippage
+   y: ofi_window total_adverse  − 1D total_adverse
+   colour by session, shape by signal
+   Quadrant III (negative on both axes) = strict win.
+   Apr-30 ofi_window is the only point in quadrant III.
+
+D. λ sweep line chart per session, for ofi_window vs 1D
+   x: λ ∈ {0, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5}
+   y: Δ(ofi_window − 1D)
+   reference y=0
+   Apr-30 line stays below y=0 across the full range; Apr-21/28 cross
+   above zero around λ ≈ 0.02.
+
+E. Action mix grouped bar
+   x: action ∈ {WAIT, PASSIVE, AGGR}, y: mean % across 10 seeds
+   one bar group per (session × mode)
+   ofi_window's PASSIVE bar is taller than 1D's on every session, but
+   only by 1.4-2.0pp (vs vol_delta's +2.5-3.0pp). Less greedy on
+   passive fills than the other adverse signals.
+
+F. Bucket occupancy heatmap for ofi_window on Apr-30
+   x: pressure bucket (6), y: ofi_window bucket (3), colour: visits
+   The 12 inner cells (pressure ∈ [-0.5, +0.5]) all hold thousands of
+   ticks. Tail cells empty. Same density story as §23.
+
+All raw numbers are in data/derived/ab_adverse_3sessions_10seed.json.
+
+================================================================================
+ END OF §24 — 2026-04-30
+================================================================================
+
+
+================================================================================
+25. A/B/C TEST ON SESSION 7 — DOES ofi_window REPRODUCE? (2026-05-01)
+================================================================================
+
+PLOTS (all generated from real numbers in the JSON, not assumptions)
+--------------------------------------------------------------------
+  data/derived/figures/section25/
+    fig01_total_loss_per_session.png            mean total_loss per (session × mode)
+    fig02_paired_diff_vs_1d.png                 paired diff vs 1D, |t| labels
+    fig03_per_seed_scatter_ofi_window_vs_1d.png 4 panels, one dot per seed
+    fig04_action_mix_per_session.png            WAIT/PASSIVE/AGGRESSIVE shares
+    fig05_slippage_vs_adverse.png               $-slip vs $-adverse Pareto plot
+
+Source data: data/derived/ab_adverse_3sessions_10seed.json (160 rows, 200s run)
+Re-built with: PYTHONPATH=. python scripts/_plots_section25.py
+
+
+WHAT THIS EXPERIMENT IS, IN PLAIN WORDS
+---------------------------------------
+THE SANDBOX RULE.  At every tick, the agent has been told to BUY 1 unit
+of BTC. Not "decide whether to buy". The buying is forced. The only
+question is HOW to buy:
+
+  WAIT       → don't send an order this tick. Skip and look again
+               in 100 ms. Cheap if price is about to fall, costly if
+               it's about to climb away from you.
+  PASSIVE    → post a limit buy at the current best bid. Fills only if
+               a seller comes down to our price next tick. When it
+               fills, we save the half-spread (good). When it fills
+               BECAUSE the market is dropping, we just bought right
+               before a fall (toxic).
+  AGGRESSIVE → cross the spread, take the best ask, fill guaranteed,
+               pay the half-spread as instant slippage.
+
+Every tick we lose money in two ways: SLIPPAGE (the $ we pay above
+mid when we fill) and ADVERSE_MOVE (the $ the mid moved against us
+right after we filled — i.e. we bought just before a drop). Total
+cost per tick = slippage + λ * adverse_move with λ = 0.1 (a regret
+multiplier set in §9 to make passive's toxicity hurt enough that the
+policy can't just pick passive forever to game the slippage metric).
+
+THE FOUR POLICIES WE COMPARE.
+  baseline (1D)  Hedge weights split by current "market pressure" only.
+                 6 buckets along pressure ∈ [-∞,-0.5,-0.2,0,+0.2,+0.5,+∞].
+                 This is the §15 winner — beats marginal by +29% loss.
+  A vol_delta    2D: pressure × (vol_30s_now − vol_30s_60s_ago).
+                 Reads "is volatility rising in the last minute?"
+  B ofi_window   2D: pressure × (sum of ofi_l1 over the last 60s).
+                 Reads "has there been sustained net buy/sell pressure
+                 over the last minute?"  — this is the only signal that
+                 has ever beaten 1D at λ=0.1 in this project (§24, S3).
+  C spread_delta 2D: pressure × (spread_now − spread_60s_ago).
+                 Reads "is the bid/ask spread widening?" — meant to
+                 catch liquidity drying up before adverse moves.
+
+WHAT WE ARE TRYING TO PROVE.  §24 found that B beat 1D on the Apr-30
+session 3 (8/10 seeds, |t|=2.37, only ofi_window achieved this — A
+and C lost on every seed). Three explanations were possible:
+
+  Hypothesis A — SAMPLE SIZE.   B needs ~64k+ ticks per session to
+                                learn cleanly. 38k is below threshold.
+  Hypothesis B — MARKET CHARACTER.  Apr-30 had multi-hour trends;
+                                    the cumulative-OFI signal is only
+                                    informative in trending markets.
+  Hypothesis C — LUCK.          |t|=2.37 is at the edge of the usual
+                                significance bar; could be noise.
+
+Decision rule (set in advance — see §25 PLANNED block, now superseded):
+  - B wins on session 7 with |t| ≥ 2.0  →  hypothesis A or B confirmed,
+                                            consider promoting B 2D.
+  - B loses with |t| ≥ 2.0              →  hypothesis C (luck) wins.
+  - |t| < 2.0                            →  inconclusive, need a 3rd
+                                            long session.
+
+
+THE NEW DATA — SESSION 7
+------------------------
+A 21.08-hour clean session was captured between 2026-04-30 23:00 UTC
+and 2026-05-01 20:05 UTC. 75,885 feature rows. Zero sequence_gap
+rows. This is the BIGGEST session ever captured (vs 63,590 ticks /
+17.66h for session 3). Mid-price moved $2,696 over the window
+(3.48% of mid) — about 2× the mid-range of session 3 (1.77%), so
+similar character (trending) but more directional movement.
+
+  feature                  S3 (winner)        S7 (NEW)
+  ------------------------ ------------------ ------------------
+  rows                     63,590             75,885   (+19%)
+  duration                 17.66h             21.08h
+  mid range                $1,345 (1.77%)     $2,696 (3.48%)
+  vol_30s mean             3.37e-5            3.04e-5
+  vol_30s peak             2.51e-3            1.09e-3
+  vol_30s nonzero          91% (from §16)     86%
+  sequence_gap rows        0                  0
+
+
+HOW WE RAN IT
+-------------
+Edited TARGET_SESSIONS in scripts/_ab_adverse_3sessions.py from
+[1,2,3] to [1,2,3,7], then:
+  PYTHONPATH=. python scripts/_ab_adverse_3sessions.py
+160 runs in 200s (4 sessions × 10 seeds × 4 modes). Bit-identical
+results on sessions 1-3 vs §24 (1415.30, 1561.52, 2500.08 baselines
+match exactly — §15 / §21 / §23 reproduced) — so the new run
+just APPENDS session 7 evidence; nothing changed underneath.
+
+
+REAL RESULTS (from the JSON, not summary or rounded)
+----------------------------------------------------
+
+   Session 7 (the test case, 75,885 ticks, 21.08h)
+   ------------------------------------------------
+   mode            mean_loss     std    Δ vs 1D     |t|    seeds beating 1D
+   1D baseline     2868.74     49.78        --       --             --
+   A vol_delta     3034.38     51.00     +165.65   25.05    0/10  (LOSES)
+   B ofi_window    2866.44     34.44       -2.30    0.23    5/10  (TIE)
+   C spread_delta  2963.78     45.93      +95.05   24.42    0/10  (LOSES)
+
+   Side-by-side with the prior 3 sessions
+   --------------------------------------
+   session  ticks   1D loss      A diff (|t|)        B diff (|t|)         C diff (|t|)
+   S1       38,973  1415.30     +133.51 (28.89)     +15.31 ( 2.97)       +68.07 (12.65)
+   S2       38,977  1561.52     +115.50 (34.73)     +19.97 ( 5.45)       +51.93 (12.20)
+   S3       63,590  2500.08     +168.87 (34.72)      -9.79 ( 2.37) WIN   +90.81 (28.48)
+   S7       75,885  2868.74     +165.65 (25.05)      -2.30 ( 0.23) TIE   +95.05 (24.42)
+
+   Across all 4 sessions:
+     A vol_delta:    0/40 paired wins.  Always strictly worse, big |t|. DEAD signal.
+     C spread_delta: 0/40 paired wins.  Always strictly worse, big |t|. DEAD signal.
+     B ofi_window:   16/40 paired wins. Mean diff: -10.30 (S3) to +20 (S2).
+                     Significant LOSS on S1/S2; significant WIN on S3 only;
+                     INDISTINGUISHABLE from 1D on S7 despite +19% more data.
+
+   Pareto check on S7 (slippage AND adverse, both lower = strict win)
+   -----------------------------------------------------------------
+   mode           slip $       adv $        fill_rate
+   1D baseline    105.56       27,631.72     54.13%
+   A vol_delta     97.17       29,372.20     55.38%   slip↓  adv↑↑   loses
+   B ofi_window    98.98       27,674.56     55.58%   slip↓  adv≈    nearly Pareto
+   C spread_delta 102.17       28,616.10     54.86%   slip↓  adv↑    loses
+
+   ofi_window saved $6.58 of slippage per session on S7 but gave $42.84
+   of adverse back — net -$2.30 at λ=0.1. NOT a strict Pareto win on S7
+   (S3 was: ofi_window beat on BOTH slip and adverse there).
+
+
+VERDICT
+-------
+APPLYING THE DECISION RULE: |t| = 0.23 < 2.0 →  INCONCLUSIVE.
+
+What this concretely means for the three hypotheses:
+  - Hypothesis A (sample size) is WEAKENED. We added 19% more ticks and
+    the win not only failed to grow stronger — it shrank from -9.79 (|t|=2.37)
+    to -2.30 (|t|=0.23). If the signal were data-starved, more data should
+    have HELPED. It did not.
+  - Hypothesis B (market character) is STILL PLAUSIBLE. S7 had even more
+    price movement than S3 (3.48% vs 1.77% mid range), but it's a different
+    KIND of movement — more directional drift, less persistent
+    multi-hour-trend structure. The cumulative-OFI signal might only matter
+    in a narrower regime than just "trending".
+  - Hypothesis C (luck) gains weight. The S3 win was at the very edge of
+    conventional significance, and it did not reproduce on S7. The
+    "ofi_window beats 1D" claim does NOT generalize from a single session.
+
+CONCLUSION: B is not yet a real winner. 1D bucketed remains the default.
+ofi_window stays in the candidate pool, but moves from "promising" to
+"inconclusive — needs more evidence".
+
+A and C are now resoundingly DEAD signals (0/40 across every session,
+big |t|s). They consistently make the policy more passive (higher
+fill_rate by ~1.0-1.5pp) but the extra fills are toxic — slippage savings
+get more than reversed by adverse-move costs.
+
+
+NEXT STEPS
+----------
+1. Capture a 3rd long session (>15h). Per §25 decision rule.
+   * If B wins again with |t| ≥ 2.0, hypothesis B (market character)
+     gets its first real evidence; we can also start checking whether
+     the win correlates with realized directional flow.
+   * If B is again in the noise, we close the book on ofi_window and
+     move to the next candidate (perhaps a STRICTER OFI signal —
+     longer window, or thresholded "sustained_one_sided_flow" boolean
+     — or shift entirely to non-Hedge approaches).
+   * If B loses cleanly, hypothesis C (luck) confirmed; B joins A and C
+     on the dead-signals pile.
+2. Drop A (vol_delta) and C (spread_delta) from future A/B harnesses.
+   They are wasting compute. The §24 harness can be slimmed to just
+   1D vs ofi_window once we've decided.
+3. Investigate the $4 worth of "marginal Pareto-ness" on B's S7 numbers.
+   Is there a λ sub-regime where B Pareto-dominates? (A λ-sweep on S7
+   alone, B vs 1D, would answer this in ~3 minutes.)
+4. Consider: 6×2 ofi_window (binary positive vs negative net flow,
+   instead of 3 buckets) to see if a coarser signal generalizes
+   better.
+
+================================================================================
+ END OF §25 — 2026-05-01
+================================================================================
+
+
+================================================================================
+26. APPENDIX TO §25 — CAVEMAN-BRAIN EXPLANATION (2026-05-01)
+================================================================================
+
+This block is the same §25 result, but in plain words. Same numbers, no
+new experiment.
+
+
+THE WHOLE EXPERIMENT IN ONE LINE
+--------------------------------
+"1 vs A/B/C" is just "bucketed by ONE thing (pressure) vs bucketed by
+TWO things (pressure + one extra axis). Pick any extra axis you want."
+
+  1 = pressure                                  → 6 buckets
+  A = pressure × (volatility rising in last 60s) → 6 × 3 buckets
+  B = pressure × (net buy/sell flow last 60s)    → 6 × 3 buckets
+  C = pressure × (spread widening last 60s)      → 6 × 3 buckets
+
+Same data, same Hedge algorithm, same buy-1-BTC-every-tick rule. The
+ONLY difference is what the second axis is. We are asking: does adding
+a second axis make better decisions, and if so, which axis?
+
+
+WHAT IS "LOSS" IN PLAIN WORDS
+-----------------------------
+We are forced to buy 1 BTC every tick. Two bad things can happen each
+time:
+
+  1. SLIPPAGE — the cash we pay above the fair mid-price to actually
+     get the trade filled. Like the supermarket sells milk at $4.50
+     but the corner store only has it for $5. The extra $0.50 is
+     slippage. Real money, gone right now.
+
+  2. ADVERSE MOVE — the price drops right AFTER we buy. We didn't
+     lose cash out of pocket, but we definitely could have waited and
+     paid less. Like buying milk at $5 then seeing it on sale for $4
+     ten seconds later. That $1 is regret, not cash, but it still hurts
+     the same way over thousands of trades.
+
+  Total loss = slippage + 0.1 × adverse_move
+
+The 0.1 (called λ) is a knob that says "regret hurts, but only one-tenth
+as much as cash slippage". Without that knob the agent would learn to
+wait passively forever and just sit there catching falling knives. The
+0.1 forces it to take some bumps to dodge worse bumps.
+
+So if you see "loss = 2868" on session 7, that means: about $105 of
+real out-of-pocket slippage + $2,763 worth of regret about prices that
+dropped right after we bought.
+
+
+THE NUMBERS, SCALED TO REAL MONEY
+---------------------------------
+Session 7 = 21 hours straight. ~75,885 buy attempts, ~41,000 actually
+filled. At $77,000 per BTC, that's about $3.2 BILLION of buying done in
+this one session.
+
+Against that giant pile of trades:
+
+  strategy        cash slippage    regret      combined loss
+  1D (default)    $105.56         $27,632      2868.74     ← winner
+  A vol_delta     $97.17          $29,372      3034.38
+  B ofi_window    $98.98          $27,675      2866.44     ← tied with 1D
+  C spread_delta  $102.17         $28,616      2963.78
+
+Per individual fill:
+  - 1D pays about $0.0026 of slippage per fill (a quarter of a cent).
+  - 1D suffers about $0.67 of regret per fill (price moved against us
+    right after we bought).
+
+So regret is roughly 250× larger per fill than slippage. That's WHY
+adverse_move dominates the total loss number, even with the 0.1
+multiplier knocking it down. If you see 1D's loss is ~2868, almost all
+of that is regret, not actual cash out the door.
+
+
+WHO WON, AND WHY THE DATA SAYS SO
+---------------------------------
+The winner is **1D bucketed (pressure only)** — the simple version we
+already had. Not by being amazing. By being un-beaten.
+
+  challenger A (volatility rising)        — tried 4 sessions × 10 seeds
+                                            against 1D. Lost ALL 40
+                                            comparisons. Big margins.
+                                            Dead.
+
+  challenger B (60s net buy/sell flow)    — tried 4 sessions × 10 seeds
+                                            against 1D. Won 16/40.
+                                            Won decisively only on Apr-30
+                                            (8/10 seeds, |t|=2.37). On
+                                            the new, BIGGER session 7
+                                            it tied (5/10, |t|=0.23).
+                                            Coin flip. Not a real win.
+
+  challenger C (spread widening)          — tried 4 sessions × 10 seeds
+                                            against 1D. Lost ALL 40
+                                            comparisons. Big margins.
+                                            Dead.
+
+When we say "|t| = 0.23", that's a noise check. Rule of thumb:
+
+  |t| < 1.0  → totally inside the noise. Same as flipping a coin.
+  |t| ≈ 2.0  → starting to look real, but still 1-in-20 to be luck.
+  |t| > 3.0  → almost certainly real.
+  |t| > 10.0 → no doubt at all, the difference is real.
+
+The losses for A and C had |t| values of 12-35. Real, no doubt. The
+"win" for B on session 7 had |t|=0.23. Pure noise. The "win" for B on
+Apr-30 had |t|=2.37 — borderline real, and now we know it didn't repeat.
+
+So 1D wins by default: nothing has clearly beaten it across multiple
+sessions yet.
+
+
+WHY DID A AND C MAKE THINGS WORSE?
+----------------------------------
+Both signals (volatility rising, spread widening) basically tell the
+agent "things are getting weird right now". The agent's reaction is to
+become MORE PASSIVE — sit on a limit bid, hope a seller comes to us,
+save the spread.
+
+This is wrong. When things are getting weird, sellers come to your
+passive bid because **the price is dropping**. You "saved the spread"
+by buying at the bid right before the price fell another $20.
+
+  BEFORE (1D, S7):           54.13% of ticks filled, $105 slip, $27,632 adv
+  AFTER (A, S7):             55.38% of ticks filled, $97 slip,  $29,372 adv
+
+A saved $8 in slippage by filling 1.25 percentage points more often.
+But those extra fills cost $1,740 more in adverse moves. Net: A is $165
+worse on combined loss.
+
+Same story for C, just less extreme.
+
+The signals are not useless — they really do detect "things are getting
+weird". The agent just reacts to that signal in the wrong direction.
+Maybe the right reaction is the OPPOSITE: when vol is rising or spread
+is widening, get MORE aggressive (or wait), not more passive. We
+haven't tested that yet.
+
+
+WHAT THIS WOULD LOOK LIKE IN THE REAL WORLD
+-------------------------------------------
+If you ran 1D on a real Binance API with $1M of buying capacity per day:
+
+  - Expected slippage cost: about $33 per million traded per day.
+    (BPS: 0.033 — basically free, in execution-cost terms.)
+  - Expected regret: somewhat larger but harder to pin down because it
+    depends on what you would have done with the money you "wasted" by
+    buying just before drops.
+
+If you ran A or C instead, you'd pay an extra $30-ish per million
+traded per day in regret-equivalent. Doesn't sound like much, but at
+institutional volume that compounds into the difference between a
+profitable execution desk and one that's barely breaking even.
+
+If you ran B instead of 1D, you'd see no measurable improvement on
+real money — the difference is below the noise of normal trading.
+You'd just have a more complex system to maintain (3× as many
+weight tables, a 60-second rolling buffer to keep current) for
+nothing.
+
+
+WHAT WE CAN START TO ASSUME (NOT PROVE — JUST BELIEVE A LITTLE)
+---------------------------------------------------------------
+Each of these is a hypothesis the data lets us start trusting. Treat
+them as starting points for the NEXT experiment, not as facts.
+
+  1. AT 100 ms BTC, KNOWING THE PRESSURE IS ENOUGH.
+     Every attempt to add a second axis (Kalman regime, vol_delta,
+     spread_delta, ofi_window) has either lost outright or failed to
+     clearly win. The simplest model is winning. Adding state splits
+     the data thinner without adding enough signal.
+
+  2. "THINGS ARE GETTING WEIRD" SIGNALS PUSH THE AGENT THE WRONG WAY.
+     vol_delta and spread_delta both make the agent more passive in
+     volatile / widening-spread moments. Both LOSE. Real signal,
+     wrong reaction. Worth testing the inverted version (be more
+     aggressive when things are getting weird).
+
+  3. ofi_window IS REAL BUT NARROW.
+     It's the only signal that has ever beaten 1D. It won once
+     (Apr-30) and tied once (May-1). There's likely a market regime
+     ("sustained one-sided flow") where it would win clearly, but
+     we haven't isolated it. Next move is regime-CONDITIONAL, not
+     swap-the-policy.
+
+  4. ONE-SESSION WINS ARE NOT WINS.
+     Apr-30 ofi_window looked solid (|t|=2.37). We almost promoted
+     it. Session 7 cooled it back down. Going forward, no policy
+     change should be considered a real win without ≥ 2 independent
+     sessions at |t| ≥ 2.0. Cheap rule that would have caught this.
+
+  5. THE BIG GAINS, IF THEY EXIST, ARE NOT IN STATE BUCKETING.
+     Three different attempts to enrich state hit a wall. The next
+     real improvement probably comes from a DIFFERENT SHAPE of
+     decision (variable order size, multi-tick planning, queue-
+     position modeling) — not from a smarter version of "split the
+     ticks into more buckets and learn weights per bucket".
+
+
+WHAT'S NEXT
+-----------
+Listed in order of cheapest first.
+
+  1. Capture a 3rd long session (≥ 15h) to break the B tie cleanly.
+     Same ingest process as before. Run the same harness with
+     TARGET_SESSIONS = [1, 2, 3, 7, <new>]. Total runtime ~ 4 min.
+
+       - If B wins again with |t| ≥ 2.0 → hypothesis "B works in
+         trending markets" gets its first real evidence. Promote.
+       - If B is again in noise → close the book on B. Move on.
+       - If B clearly loses → "luck" hypothesis confirmed. Move on.
+
+  2. Drop A and C from the next harness (they are 0/40 — pure waste
+     of compute). Keep just 1D vs B for §27.
+
+  3. Run a λ-sweep on session 7 for B vs 1D alone. Maybe there's a
+     λ region where B Pareto-dominates that we'd miss at λ=0.1 only.
+     ~3 minutes of compute.
+
+  4. Try INVERTING A and C (act more AGGRESSIVE when vol or spread
+     is rising, instead of more passive). Cheap to code. The signals
+     are clearly informative — the only question is the sign of the
+     reaction.
+
+  5. If §27 also leaves B ambiguous, accept that 1D is the model and
+     start working on a different decision shape: variable order
+     size (buy 0.5 BTC sometimes, 2 BTC other times) instead of
+     fixed 1-BTC-per-tick.
+
+================================================================================
+ END OF §26 — 2026-05-01
+================================================================================
+
+
+================================================================================
+27. PRESENTATION-PREP DAY (2026-05-04)
+================================================================================
+
+A long working day with one explicit user-facing goal: produce a
+slide-deck preview for the thesis presentation that's a week out
+(2026-05-11ish). The day produced FIVE concrete deliverables, ONE
+real bug fix in live mode, and ONE new headline result that closes
+the only open hole in the experimental narrative (the §15 1D-vs-
+marginal headline finally became a 4-session result instead of a
+1-session result).
+
+Run order at the end of this entry shows everything in one place.
+
+
+----------------------------------------------------------------------
+27.1 LIVE-MODE BOOK CORRUPTION — diagnosed and fixed
+----------------------------------------------------------------------
+
+Symptom Damián saw running scripts/10_live_gui.py in Live mode:
+  - Spread column showing values like -100, -84, -112 (impossible
+    in a real book — best_ask is always ≥ best_bid).
+  - Slippage on AGGRESSIVE rows showing -50, -42, -56 (also
+    impossible — AGG buys at best_ask, slippage = best_ask − mid
+    must be POSITIVE in a healthy book).
+  - The savings curve trending strongly NEGATIVE (-$1,992 in
+    ~130 ticks).
+
+Root cause: live_source.py was violating the Binance snapshot+stream
+sync protocol — the same pattern that caused the §1 bug. Original
+code did:
+    snapshot = fetch()           ← snapshot first
+    open WS                      ← WS second
+    apply WS events
+That order leaves a hole between the snapshot and the first WS
+event during which Binance has already advanced the book, and the
+deltas that subsequently arrive apply to a stale state. The local
+book diverges from reality, eventually best_bid creeps above
+best_ask, and every downstream computation goes sideways.
+
+Fix landed in two iterations:
+
+  Iteration 1 — naive sequential reorder
+    1. open WS
+    2. buffer WS events for ~2.5s
+    3. fetch snapshot
+    4. find bridge in buffer
+    Failed because Binance REST often returns AFTER WS has
+    advanced — snapshot.last_update_id ends up AHEAD of every
+    buffered WS event ("snapshot ahead of buffer"). Code retried
+    forever.
+
+  Iteration 2 — concurrent state machine (current code)
+    1. open WS, kick off snapshot fetch on a separate task at the
+       same time
+    2. read WS events with 0.3s timeout, accumulate into buffer
+    3. when snapshot lands, classify buffer relative to snap_uid
+       into one of four states:
+         'found'  — bridge event found, apply snapshot + bridge +
+                    tail
+         'ahead'  — all buffered events end before snap_uid →
+                    keep reading WS, bridge will come
+         'behind' — first buffered event starts past snap_uid+1
+                    → snapshot is stale, refetch
+         'gap'    — there's a post-snapshot event but it doesn't
+                    bridge → refetch snapshot
+    4. absolute 20s timeout on the whole seeding step
+    5. on detected sequence gap during live processing, force a
+       reseed by closing the WS
+
+Defensive guard added: every emitted feature is checked for
+crossed-book pathology (best_ask > best_bid, mid in [bid, ask],
+spread > 0). Anything failing those checks is dropped with a
+warning rather than fed into Kalman.
+
+Files:
+  src/live/live_source.py       — full rewrite of _run_async / _seed
+  scripts/10_live_gui.py        — unchanged
+
+Verification: after the fix, the live source emits a clean log line
+"LiveSource SEEDED — snap_uid=... bridge=[U=..., u=...]" once per
+successful seed, then transitions to live processing. No more
+"snapshot ahead of buffer" loops.
+
+Replay mode was unaffected by this bug — it consumes the offline
+parquet which was generated by the proper book_builder pipeline
+that follows the §5.1 self-heal logic correctly.
+
+
+----------------------------------------------------------------------
+27.2 GUI CHART PANE POLISH — savings curve renders properly
+----------------------------------------------------------------------
+
+User reported earlier in the day that the Money-Saved panel of the
+GUI chart was blank (the Mid+markers panel and the per-bucket bars
+panel were rendering fine). Two issues fixed in src/gui/chart_pane.py:
+
+  - A FillBetweenItem was created but never added to the plot. It
+    nonetheless attached itself to the curve's update signal and
+    appeared to be interfering with the redraw. Killed.
+  - A floating TextItem was being repositioned in plot coordinates
+    every refresh, which auto-range could push off-screen. Killed
+    and replaced with dynamic plot-title updates using HTML coloring.
+
+The savings curve now uses fillLevel=0 + brush directly on the
+PlotDataItem (the documented pyqtgraph idiom for filled-area line
+plots) — same render path the working mid-line plot uses. The
+running $ saved amount now appears in the panel title, e.g.
+"Money saved vs always-AGGRESSIVE — $+47.83" with green text
+when winning, red when losing.
+
+Files:
+  src/gui/chart_pane.py
+
+
+----------------------------------------------------------------------
+27.3 THE §15 HEADLINE FINALLY BECOMES MULTI-SESSION
+----------------------------------------------------------------------
+
+The §15 result (1D pressure-bucketed Hedge beats marginal Hedge by
+~29% with paired |t|=64) had been the headline of the project
+since 2026-04-21, but it had only ever been measured on session
+S1. Item U1 in the §27/§29 plan list was "Confirm C2 is multi-
+session." Today we finally did it.
+
+New harness:
+  scripts/_ab_1d_vs_marginal_4sessions.py
+  
+Runs marginal vs 1D bucketed over sessions [1, 2, 3, 7] × 10 seeds
+each, identical config to §15/§21/§23/§24 protocols (η=0.10,
+λ=0.10, pressure_edges = [-0.5, -0.2, 0, +0.2, +0.5], same Kalman
+config). 80 paired runs total, 99-second wall-clock.
+
+Output:
+  data/derived/ab_1d_vs_marginal_4sessions.json
+
+RESULTS — every cell is a CLEAN win for 1D bucketed:
+
+  Session  marginal mean   1D mean       diff       improvement   |t|
+  ------------------------------------------------------------------------
+  S1       1985.35         1415.30       -570.05    -28.7%         64.2
+  S2       2130.91         1561.52       -569.39    -26.7%         36.8
+  S3       3816.71         2500.08      -1316.63    -34.5%         95.1
+  S7       4154.68         2868.74      -1285.94    -31.0%        105.3
+
+Per-seed: 40/40 paired comparisons go in 1D's favor. Not a single
+seed in any session loses.
+
+The §15 row is reproduced bit-for-bit (mean=1985.35, 1D=1415.30 —
+exactly matching the table in §15) which validates that the new
+harness is using the same code paths as the canonical experiment.
+
+This closes U1. The headline of the thesis is now:
+  "1D pressure-bucketed Hedge beats marginal Hedge across 4
+   independent sessions, all 40 paired seeds, |t| ≥ 36, mean
+   improvement 26.7% to 34.5%."
+
+That replaces the previous narrative ("...on session 1, with
+replication on S2/S3/S7 still pending") with a fully replicated
+result.
+
+
+----------------------------------------------------------------------
+27.4 TEN NEW PEDAGOGICAL FIGURES for the slide deck
+----------------------------------------------------------------------
+
+Generator script:
+  scripts/_plots_preview.py
+
+Output dir:
+  data/derived/figures/preview/
+
+Figures produced (all generated from data/derived/ab_*.json files,
+no fabricated numbers anywhere):
+
+  p01_marginal_vs_1d_bars.png         4-session bar chart with %-
+                                       improvement labels above pairs
+  p02_marginal_vs_1d_paired.png       paired diff with |t| labels
+  p03_marginal_vs_1d_scatter.png      4 panels, one per session, dot
+                                       per seed, y=x reference line
+  p04_kalman_trace.png                3 stacked panels: mid + pressure
+                                       + regime over a 33-min window of
+                                       S2 — illustrative
+  p05_features_trace.png              same window, depth_imb + ofi_l1
+                                       + vol_30s
+  p06_hedge_weights_evolution.png     4 panels, one per inner bucket
+                                       (1, 2, 3, 4); shows weights
+                                       converging through S7
+  p07_per_bucket_final_weights.png    stacked bars per pressure bucket;
+                                       loaded from frozen weights JSON
+  p08_action_mix_marginal_vs_1d.png   4 panels, one per session;
+                                       stacked WAIT/PASSIVE/AGGRESSIVE
+                                       for both modes
+  p09_savings_vs_aggr.png             cumulative loss policy vs always-
+                                       AGGR + savings curve below;
+                                       run on S7 seed 0 → +$838.64
+                                       saved over the session
+  p10_loss_decomposition.png          slip-vs-adverse Pareto with all
+                                       4 sessions × 4 modes — the
+                                       toxicity barrier visual
+
+These supersede the §25 figures for the thesis preview (the §25
+figures still exist in data/derived/figures/section25/ for the
+paper).
+
+Re-run with:
+  PYTHONPATH=. python scripts/_plots_preview.py
+
+
+----------------------------------------------------------------------
+27.5 DOCS PRODUCED FOR THE PRESENTATION
+----------------------------------------------------------------------
+
+Five new/updated documentation files. All in repo, all in Spanish or
+mostly-Spanish where the audience is Spanish-speaking.
+
+  docs/preview_slides.md (734 lines)
+    27-slide deck content, slide by slide. Each slide has: title,
+    bullets to copy-paste, figure path to include, and notes for
+    the orator. Spanish, accessible to non-math-major engineers.
+    Covers: problem, architecture, Kalman (3 slides), Hedge (4
+    slides), bucketed Hedge, methodology, results positive,
+    results negative, toxicity barrier, conclusions. 15-20 min
+    speaking time.
+
+  docs/thesis_defense_qa.md (994 lines, 85 questions)
+    Comprehensive Q&A doc for thesis defense. 13 sections:
+    motivation, architecture, Kalman specifics, Hedge specifics,
+    bucketing, features, loss/simulator, statistical methodology,
+    results, negative results, reproducibility, future work,
+    adversarial questions, plus quick-fire. Each answer is 2-4
+    paragraphs of plain language; designed to demonstrate full
+    mastery of the system, not just memorize talking points.
+
+  docs/math_explained.md (1053 lines, 8 parts)
+    The math walkthrough document, in plain English. Built up
+    over the day:
+      Parts 1-6: what the dollar numbers mean, where they come
+                  from per tick, the three features, why we
+                  normalize, how we go from numbers to claims.
+      Part 7:    The Hedge algorithm from zero (no jargon) — the
+                  restaurant analogy, definitions of distribution/
+                  sampling/regret, the update rule, why exp(-η·L),
+                  the regret bound applied to our T=75k K=3.
+      Part 8:    A real worked example, end to end. Tick #800 of
+                  S7 walked through with the actual numbers from
+                  scripts/_debug_one_tick.py — parquet row,
+                  standardization, predict, update (innovation/
+                  S/K/posterior), bucket lookup, frozen weights,
+                  sampling u=0.6370 → AGGRESSIVE, simulator
+                  (slippage +$0.005, adverse +$0.005, loss
+                  +$0.0055), Hedge update. Every number is what
+                  the code computes.
+
+  reasons.txt (root of repo, ~250 lines)
+    The narrative for the thesis defense + hedge-fund interviews
+    explaining the journey from "wanted to write a poker solver"
+    to "ended up with a microstructure execution thesis." Five
+    phases: original poker idea → realization that markets have
+    the same structure → pivot to microstructure → simplification
+    to 3-action sandbox → the architecture that resulted.
+    Includes copy-paste-ready interview lines and a 200-word
+    elevator pitch for the defense.
+
+  scripts/_walkthrough_terminal.py (~600 lines)
+    Interactive terminal walkthrough — see §27.6 below.
+
+  scripts/_debug_one_tick.py
+    The one-shot script that pulls real numbers for tick #800 of
+    S7. Used to populate Part 8 of math_explained.md. Re-runnable
+    for verification.
+
+
+----------------------------------------------------------------------
+27.6 INTERACTIVE TERMINAL WALKTHROUGH
+----------------------------------------------------------------------
+
+  scripts/_walkthrough_terminal.py
+
+What it is: a slow, ENTER-to-advance pipeline visualization that
+walks through every block of the diagram for one tick at a time,
+in Spanish, with pretty-printed Unicode matrices (⎡ ⎣ ⎤ ⎦) and
+per-cell annotations explaining what each entry of each matrix
+means.
+
+Block sequence per tick (each block waits for ENTER):
+  [BLOQUE 1]  Fila del parquet — ts_ms, bid/ask/mid/spread,
+               depth_imb, ofi_l1, vol_30s, next mid
+  [BLOQUE 2]  Estandarización — z_raw → (z_raw − center) × scale
+               → z_norm, with per-component arithmetic shown
+  [BLOQUE 3a] Kalman PREDICT — x_prior, P_prior, F, Q each shown
+               with their description and per-cell meaning;
+               x_pred = F·x_prior step by step; P_pred = F·P·Fᵀ + Q
+               with intermediate (F·P), (F·P·Fᵀ), and final result
+  [BLOQUE 3b] Kalman UPDATE — H, R introduced with per-cell
+               annotations; innovation y = z_norm − H·x_pred;
+               innov covariance S; gain K = P·Hᵀ·S⁻¹ (with
+               intermediate P·Hᵀ and S⁻¹ shown); posterior
+               x_post = x_pred + K·y; posterior P_post
+  [BLOQUE 4]  Bucket lookup — pressure value, edges, the 6 buckets
+               listed with their semantic meaning, "← AQUÍ" marker
+               on the chosen bucket
+  [BLOQUE 5a] Frozen weights — distribution for chosen bucket with
+               Unicode bar visualization
+  [BLOQUE 5b] Action sampling — cumulative slices, u draw, action
+  [BLOQUE 6]  Simulator — fill outcome with adaptive text
+  [BLOQUE 7]  Loss computation — slippage, adverse, λ·adverse, total
+  [BLOQUE 8]  Hedge update (illustrative) — exp(-η·L) factor, before/
+               after weights, renormalization, per-action delta
+  [RESUMEN]   tick loss, cum loss, baseline cum, savings vs always-AGG
+
+CLI:
+  PYTHONPATH=. python scripts/_walkthrough_terminal.py
+  PYTHONPATH=. python scripts/_walkthrough_terminal.py --session 7 --start-tick 800 --max-ticks 3
+  PYTHONPATH=. python scripts/_walkthrough_terminal.py --auto    (no pauses, for testing)
+
+ANSI colors auto-disable when stdout isn't a TTY.
+
+The matrix annotation format (per-cell meaning):
+  ◆ H — matriz de observación. Filas = features (3), columnas = estados ocultos (2).
+        H[i,j] = 1 si la feature i 'mira' directamente al estado j; 0 si no.
+   H = ⎡ +1.00  +0.00 ⎤
+       ⎢ +1.00  +0.00 ⎥
+       ⎣ +0.00  +1.00 ⎦
+       H[0,0]  = +1.0000  →  depth_imbalance OBSERVA la presión
+       H[0,1]  = +0.0000  →  depth_imbalance NO observa el régimen
+       H[1,0]  = +1.0000  →  ofi_l1 OBSERVA la presión
+       H[1,1]  = +0.0000  →  ofi_l1 NO observa el régimen
+       H[2,0]  = +0.0000  →  vol_30s NO observa la presión
+       H[2,1]  = +1.0000  →  vol_30s OBSERVA el régimen
+
+Same treatment for x_prior, P_prior, F, Q, R, y, S, K, x_post,
+P_post, z_raw, center, scale.
+
+
+----------------------------------------------------------------------
+27.7 CONCEPTUAL Q&A CAPTURED IN THE CONVERSATION
+----------------------------------------------------------------------
+
+These came up in the working session and are worth preserving even
+though the answers live in the docs above. The defense Q&A and
+math_explained docs cover the core; this is a quick index of
+question→answer-location for fast lookup.
+
+  Q: Are these "trades" other people buying BTC?
+     → No. Each row is OUR agent's simulated decision against the
+       recorded order book. Market data is real, action and fill
+       are simulated. (RESULTS_REPORT.txt has the analogy of the
+       two pretend traders.)
+
+  Q: How can we "know how much money we save"?
+     → It's a counterfactual: same data, two pretend traders, one
+       runs marginal/AGG-baseline, the other runs our policy.
+       Subtract their clipboard totals. (math_explained.md Part 1
+       and "savings number" appendix.)
+
+  Q: Are those numbers "real"?
+     → Real in the sense that the data is real and the math is
+       correct. Not real in the sense that fees, queue position,
+       latency are not modeled. The savings is a fair clipboard
+       comparison, not a P&L forecast. (defense_qa Q44/Q45.)
+
+  Q: Is the Kalman framework specific to this problem, or generic?
+     → The FRAMEWORK (predict + update, the matrices F/H/Q/R/K/P)
+       is universal. The DIMENSIONS and VALUES are problem-
+       specific. For a braking system you'd have 3 states
+       (pos/vel/decel), 3-dim observation (GPS/wheel/accel), F
+       encoding kinematics with cross-terms, etc. For us the 2D
+       state (pressure, regime) and 3D observation (depth, ofi,
+       vol) come from the Bouchaud transient/permanent
+       decomposition.
+
+  Q: Are we using online learning anywhere?
+     → Yes during offline TRAINING (the Hedge update rule applied
+       to recorded data is exactly online learning). No in the
+       GUI deployment — we use frozen weights for reproducibility
+       and deterministic demo. The Kalman filter does online
+       INFERENCE (state updates each tick) but not online learning
+       (its parameters F/H/Q/R never change).
+
+  Q: Would online learning be beneficial?
+     → For real deployment yes — adapts to regime shifts. But it
+       has tradeoffs (loss of reproducibility, no guarantees on
+       live performance, drift accumulation). Industry pattern is
+       a frozen production policy + a shadow learner + periodic
+       promotion. Crucially: online learning would NOT escape the
+       toxicity barrier — that's mechanistic, not adaptive.
+
+  Q: What is the toxicity barrier in plain words?
+     → Every signal we tried as a 2nd axis of state conditioning
+       (Kalman regime, vol_delta, ofi_window, spread_delta) is
+       really a fill-easy detector. When it fires the Hedge update
+       reweights toward PASSIVE in that cell. But fills in the
+       fill-easy moments are toxic — they're the ones where the
+       counterparty has a directional reason to cross your bid.
+       Slippage savings get more than reversed by adverse cost.
+       Identical mechanism across 4 independent signals → it's
+       structural to bucketed-Hedge at λ=0.1, not signal-specific.
+
+  Q: Do we measure regret? What's the regret bound?
+     → We don't measure regret as a reported metric. We DO use
+       Hedge, which is a no-regret algorithm — its update rule
+       achieves the bound by construction. The bound is
+       O(√(T·log K)) — for our T=75k, K=3, that's ≤ 287 units of
+       regret total over a 21h session, ~0.4 cents per decision.
+       It's a worst-case ceiling under any sequence of losses,
+       even adversarial.
+
+  Q: What is S in the Kalman update? Why "innovation"?
+     → y is the residual z − H·x_pred — "innovation" because it's
+       the NEW information the tick brings (the part not predicted).
+       Term comes from signal-processing innovation sequences.
+       S = H·P_pred·Hᵀ + R is the EXPECTED variance of y if the
+       model is right. Two pieces: H·P·Hᵀ (predict uncertainty
+       projected to obs space) + R (sensor noise itself). K uses
+       S⁻¹ as inverse-variance scaling so the gain is small when
+       S is big (lots of expected noise → don't react) and large
+       when S is small (precise observation → trust it).
+
+  Q: In the Kalman trace plot, why is regime mostly negative?
+     → Because (a) the standardization centers regime at the
+       calibration window's MEAN of vol_30s, and vol_30s has a
+       fat positive tail — the mean is dragged up by rare spikes
+       and the median sits below the mean. (b) Regime < 0 just
+       means "calmer than the calibration baseline (Apr 20-21)".
+       It's expected behavior given the data distribution, not
+       a bug. Doesn't matter for the 1D winning policy because
+       1D doesn't bucket on regime.
+
+  Q: How do I justify this thesis to a hedge fund?
+     → reasons.txt has the full narrative. Short version: poker
+       solvers (CFR family) and trading execution (Hedge family)
+       are the same mathematical structure — sequential decision
+       making under partial information with discrete action sets
+       and a probability-distribution-per-state output. Pivot to
+       microstructure was driven by data availability. The 3-action
+       sandbox is the canonical decomposition of any execution
+       problem. The toolbox (Kalman + Hedge) is exactly what HFT
+       desks use day-to-day.
+
+
+----------------------------------------------------------------------
+27.8 RUN ORDER (everything new in §27)
+----------------------------------------------------------------------
+
+# Re-run the new headline harness (4 sessions × 10 seeds × 2 modes, ~100s)
+PYTHONPATH=. .venv/bin/python scripts/_ab_1d_vs_marginal_4sessions.py
+
+# Regenerate the 10 preview figures
+PYTHONPATH=. .venv/bin/python scripts/_plots_preview.py
+
+# Get exact numbers for one tick (used by math_explained.md Part 8)
+PYTHONPATH=. .venv/bin/python scripts/_debug_one_tick.py
+
+# Interactive walkthrough of the pipeline, ENTER to advance
+PYTHONPATH=. .venv/bin/python scripts/_walkthrough_terminal.py
+
+# GUI (live mode now works correctly after the protocol fix)
+PYTHONPATH=. .venv/bin/python scripts/10_live_gui.py
+
+
+----------------------------------------------------------------------
+27.9 ARTIFACT MANIFEST AS OF 2026-05-04 EOD
+----------------------------------------------------------------------
+
+NEW SCRIPTS:
+  scripts/_ab_1d_vs_marginal_4sessions.py      4-session marginal-vs-1D harness
+  scripts/_plots_preview.py                    10-figure generator for preview
+  scripts/_debug_one_tick.py                   exact-numbers extractor (one tick)
+  scripts/_walkthrough_terminal.py             interactive ENTER-driven walkthrough
+
+NEW DOCS:
+  docs/preview_slides.md                       27-slide preview deck content (Spanish)
+  docs/thesis_defense_qa.md                    85-question defense prep doc
+  docs/math_explained.md                       8-part math walkthrough (1053 lines)
+  reasons.txt                                  poker→trading narrative for defense+interviews
+
+MODIFIED CODE:
+  src/live/live_source.py                      full rewrite of seed protocol
+  src/gui/chart_pane.py                        savings curve render fix
+
+NEW DATA:
+  data/derived/ab_1d_vs_marginal_4sessions.json   80-run paired output
+  data/derived/figures/preview/                   10 PNG figures for slide deck
+
+UNCHANGED, KEY EXISTING ARTIFACTS:
+  src/state/kalman_filter.py                   Kalman implementation
+  src/policy/hedge.py                          Hedge + bucketed variants
+  src/execution/{simulator,loss,updater}.py    execution + loss
+  configs/{kalman,policy,execution}.yaml       all hyperparameters
+  data/derived/frozen_weights/1d_session7_seed0.json    frozen 1D weights for GUI
+  data/derived/ab_adverse_3sessions_10seed.json   the §25 harness output
+  data/derived/figures/section25/              the §25 paper figures (5 PNGs)
+
+
+================================================================================
+ END OF §27 — 2026-05-04
 ================================================================================
